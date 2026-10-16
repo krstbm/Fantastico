@@ -125,19 +125,44 @@ static void log_start_fresh(void)
              "again for a clean log", g_logPath);
 }
 
+/* Resolve the configured log directory.  When PREP_LOGDIR is a relative
+ * path (e.g. "docs\examples") it is taken relative to the directory the
+ * executable lives in, so the log always lands at
+ * <exe dir>\docs\examples\example.log no matter what the current
+ * directory is.  Absolute paths (a drive letter or a UNC share) are used
+ * as-is. */
+static void log_dir_resolve(const char *rel, char *out, size_t outsz)
+{
+    char exe[MAX_PATH];
+    DWORD len, i;
+
+    if ((rel[0] && rel[1] == ':') || (rel[0] == '\\' && rel[1] == '\\')) {
+        snprintf(out, outsz, "%s", rel);
+        return;
+    }
+    len = GetModuleFileNameA(NULL, exe, MAX_PATH);
+    if (!len || len >= MAX_PATH) { snprintf(out, outsz, "%s", rel); return; }
+    for (i = len; i > 0; i--)
+        if (exe[i - 1] == '\\' || exe[i - 1] == '/') break;
+    exe[i ? i - 1 : 0] = 0;
+    snprintf(out, outsz, "%s\\%s", exe, rel);
+}
+
 void prep_init(void)
 {
     DWORD sz;
+    char logDir[MAX_PATH];
     g_logMx = CreateMutexA(NULL, FALSE, "LaptopPrep_log_mutex");
     sz = (DWORD)sizeof(g_computer);
     GetComputerNameA(g_computer, &sz);
     g_logNotice[0] = 0;
 
-    log_paths_for(PREP_LOGDIR);
+    log_dir_resolve(PREP_LOGDIR, logDir, sizeof(logDir));
+    log_paths_for(logDir);
 
     log_start_fresh();
 
-    if (!log_dir_works(PREP_LOGDIR)) {
+    if (!log_dir_works(logDir)) {
         char alt[MAX_PATH];
         int done = 0;
         alt[0] = 0;

@@ -112,9 +112,15 @@ extern "C" {
                             PREP_M_UPDATES)
 #define PREP_ALL_FLAGS     (PREP_DEFAULT_FLAGS | PREP_M_UPLOAD)
 
-/* ---- where everything is written ------------------------------- */
-#define PREP_LOGDIR  "C:\\RefurbLogs"
-#define PREP_LOGFILE "LaptopPrep.log"
+/* ---- where everything is written ------------------------------- *
+ *  PREP_LOGDIR is taken relative to the directory the executable    *
+ *  lives in when it is not an absolute path, so the log always      *
+ *  lands at <exe dir>\docs\examples\example.log no matter the cwd.  *
+ *  If that folder is not writable the engine falls back to          *
+ *  %%LOCALAPPDATA%%\LaptopPrep and then %%TEMP%%\LaptopPrep.        *
+ * ---------------------------------------------------------------- */
+#define PREP_LOGDIR  "docs\\examples"
+#define PREP_LOGFILE "example.log"
 
 /* ---- engine entry points (implemented in prep_core.c) ---------- */
 
