@@ -65,6 +65,29 @@ extern "C" {
 #define PREP_LOG_URL "https://project.catgirlz.xyz/api/v1/prep-logs"
 
 /* ---------------------------------------------------------------- *
+ *  THE UPLOADED FILE - read this before touching the log format.
+ *
+ *  Exactly one file is uploaded, the same one esprit-ict.c uploads:
+ *  C:\RefurbLogs\<COMPUTERNAME>_prep.log, POSTed whole as
+ *  Content-Type: text/plain (no multipart, no CSV, no battery HTML -
+ *  the server parses the battery/device sections out of the text).
+ *
+ *  The server validates that text against the esprit-ict.c format
+ *  and rejects it (422, code "not_a_prep_log") unless it contains,
+ *  verbatim:
+ *      === Starting laptop prep on <COMPUTERNAME> ===
+ *  and it only marks the device "complete" when the uploaded text
+ *  also contains:
+ *      === Prep phase complete ===
+ *  prep_run_all() therefore writes the first line at the start of
+ *  every run and the second one BEFORE log_upload() is called.
+ *  Rebranding or moving either line silently breaks every upload -
+ *  that is the bug that made LaptopPrep uploads disappear while
+ *  esprit-ict.c (http://localhost in that file is its placeholder
+ *  for this same route) went through.
+ * ---------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------- *
  *  Windows Update watchdogs
  *
  *  The WUA COM API is synchronous and a wedged Windows Update service
@@ -107,7 +130,7 @@ extern "C" {
  *  in the side menu.  They are bit flags, so order is free.
  * ---------------------------------------------------------------- */
 #define PREP_M_SPECS      (1u << 0)   /* CPU / RAM / OS + disks        */
-#define PREP_M_DEVICE_ID  (1u << 1)   /* serials, UUID, MAC, CSV       */
+#define PREP_M_DEVICE_ID  (1u << 1)   /* serials, UUID, MAC (in log)   */
 #define PREP_M_BOARD      (1u << 2)   /* motherboard / BIOS / slots    */
 #define PREP_M_EXTRA      (1u << 3)   /* CPU, RAM, GPU, audio, ...     */
 #define PREP_M_TPM        (1u << 4)   /* TPM status                    */
@@ -115,19 +138,25 @@ extern "C" {
 #define PREP_M_UPDATES    (1u << 6)   /* the 8-step update stage       */
 #define PREP_M_UPLOAD     (1u << 7)   /* POST the log to the server    */
 
-/* Convenience presets for the UI checkboxes.  Upload is opt-in: it is
- * pointless until an endpoint exists, and a missing endpoint is noisy. */
+/* Convenience presets for the UI checkboxes.  Upload is part of a
+ * normal run, the way esprit-ict.c does it: that tool POSTs the log
+ * unconditionally at the end of main(), it is not an extra the
+ * operator has to remember to tick.  A run without it leaves the only
+ * copy of the record on a laptop that is about to be wiped.  It can
+ * still be unticked per run in the GUI / left out on the console. */
 #define PREP_DEFAULT_FLAGS (PREP_M_SPECS | PREP_M_DEVICE_ID | PREP_M_BOARD | \
                             PREP_M_EXTRA | PREP_M_TPM | PREP_M_BATTERY | \
-                            PREP_M_UPDATES)
+                            PREP_M_UPDATES | PREP_M_UPLOAD)
 #define PREP_ALL_FLAGS     (PREP_DEFAULT_FLAGS | PREP_M_UPLOAD)
 
 /* ---- where everything is written ------------------------------- *
  *  The log is named after the machine, exactly like the esprit-ict
  *  tool: C:\RefurbLogs\<COMPUTERNAME>_prep.log, next to
- *  <COMPUTERNAME>_deviceID.csv and battery_report.html.  A folder that
- *  collects logs from fifty laptops can then tell them apart, and the
- *  three files of one machine always sit together. */
+ *  battery_report.html.  A folder that collects logs from fifty
+ *  laptops can then tell them apart.  There is no device CSV any
+ *  more: it only duplicated the log's DEVICE ID section, and the
+ *  server parses that section out of the uploaded log text.  Old
+ *  *_deviceID.csv files are still cleaned up at startup. */
 #define PREP_LOGDIR          "C:\\RefurbLogs"
 #define PREP_LOGFILE_SUFFIX  "_prep.log"
 

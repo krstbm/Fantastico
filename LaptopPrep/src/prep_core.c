@@ -72,7 +72,9 @@ static char g_logScratch[512];
 
 static HANDLE g_logMx = NULL;   /* serialises log writes */
 
-/* export a couple of paths the CSV / battery steps need */
+/* export the log path; g_deviceCsv is kept only so clean_old_logs() can
+ * name (and delete) the CSVs older builds left behind - nothing writes
+ * to it any more */
 const char *prep_log_path(void) { return g_logPath; }
 
 /* ==================================================================
@@ -579,7 +581,7 @@ void collect_specs(IWbemServices *svc)
 }
 
 /* ==================================================================
- *  collect: device identity (+ CSV)
+ *  collect: device identity (into the log text - no CSV file)
  * ================================================================== */
 void collect_device_id(IWbemServices *svc)
 {
@@ -587,7 +589,6 @@ void collect_device_id(IWbemServices *svc)
     char boardSN[512] = {0}, uuid[512] = {0}, asset[512] = {0}, encSN[512] = {0};
     char macs[2048] = {0};
     char line[4096];
-    FILE *csv;
     ULONG sz = 0;
     IP_ADAPTER_ADDRESSES *addrs = NULL, *cur = NULL;
     DWORD rc;
@@ -639,18 +640,15 @@ void collect_device_id(IWbemServices *svc)
     snprintf(line, sizeof(line), "Enclosure SN: %s", encSN);      write_log(line);
     write_log("---------------------");
 
-    csv = fopen(g_deviceCsv, "wb");
-    if (csv) {
-        fprintf(csv, "ComputerName,Manufacturer,Model,BIOS_Serial,Motherboard_SN,"
-                     "System_UUID,MAC_Addresses,Asset_Tag,Enclosure_SN\n");
-        fprintf(csv, "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n",
-            g_computer, mfr, model, biosSN, boardSN, uuid, macs, asset, encSN);
-        fclose(csv);
-        snprintf(line, sizeof(line), "Device CSV written: %s", g_deviceCsv);
-        write_log(line);
-    } else {
-        write_log("Failed to write device CSV");
-    }
+    /* No CSV file.  There used to be a <COMPUTERNAME>_deviceID.csv next
+     * to the log, but it only ever duplicated the DEVICE ID section
+     * above: the server never received it (esprit-ict.c also only ever
+     * POSTs the plain-text log), it parses everything it shows -
+     * serials, UUID, MACs, asset tag - out of this text file, and the
+     * operator asked for it gone.  So the identity lives in exactly one
+     * place now: this log, which is also the one file that is uploaded.
+     * clean_old_logs() still deletes *_deviceID.csv, so CSVs left over
+     * from older builds are removed on the next run. */
 }
 
 /* ==================================================================
@@ -3674,6 +3672,17 @@ int prep_run_all(unsigned flags)
     (void)needWmi;
 
     if (g_logNotice[0]) write_log(g_logNotice);
+    /* The esprit-ict log header, verbatim - and it has to stay verbatim.
+     * The server (POST /api/v1/prep-logs, "Ran devices") validates the
+     * uploaded text against the esprit-ict.c format and rejects anything
+     * without this exact line with 422 "not_a_prep_log: missing
+     * '=== Starting laptop prep on <HOST> ===' header".  The 1.2 rebrand
+     * of the run header ("===== LaptopPrep run =====" only) is why every
+     * LaptopPrep upload was thrown away while esprit-ict.c went through.
+     * The branded lines below it are fine - the server ignores them -
+     * but this line comes first and does not change. */
+    snprintf(line, sizeof(line), "=== Starting laptop prep on %s ===", g_computer);
+    write_log(line);
     write_log("===== LaptopPrep run =====");
     snprintf(line, sizeof(line), "LaptopPrep %s - %s", PREP_VERSION_STR, PREP_OWNER);
     write_log(line);
@@ -3741,6 +3750,14 @@ int prep_run_all(unsigned flags)
         wuOk = do_windows_update();
         gui_on_module_result(PREP_M_UPDATES, wuOk);
     }
+    /* The esprit-ict sign-off, verbatim, BEFORE the upload - exactly as
+     * esprit-ict.c does it (write_log("=== Prep phase complete ===") and
+     * only then send_log_to_server()).  The server only marks a device
+     * "complete" when the uploaded text contains this line, so it must
+     * already be on disk when log_upload() reads the file: writing the
+     * run-finished line first and uploading afterwards would ship a log
+     * the server files as incomplete. */
+    write_log("=== Prep phase complete ===");
     if (prep_select(flags, PREP_M_UPLOAD)) {
         int configured, up;
         prep_url_load();

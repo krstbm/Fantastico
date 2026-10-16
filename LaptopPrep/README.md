@@ -56,10 +56,20 @@ docs/QUALITY-REPORT.md section 6 for the diagnostic switches.
 ## Log, storage and upload
 
 * Every launch starts from a clean folder, the way the original esprit-ict tool
-  did: `C:\RefurbLogs` holds `<COMPUTERNAME>_prep.log`, `<COMPUTERNAME>_deviceID.csv`
-  and `battery_report.html`, and the previous run's copies of those three are
-  deleted before the new session writes anything - so the live log and the
-  upload describe this run only, and one laptop always has one set of files.
+  did: `C:\RefurbLogs` holds `<COMPUTERNAME>_prep.log` and `battery_report.html`
+  (plus, until the next launch deletes them, any `<COMPUTERNAME>_deviceID.csv`
+  left by an older build - no new CSV is written; the device identity is in
+  the log's DEVICE ID section), and the previous run's files are deleted
+  before the new session writes anything - so the live log and the upload
+  describe this run only, and one laptop always has one set of files.
+* **The one uploaded file is the log itself**, exactly as esprit-ict.c sends
+  it: the whole `<COMPUTERNAME>_prep.log` as a `text/plain` POST to the
+  endpoint. That only works while the log keeps the esprit format the
+  server validates - first line of a run
+  `=== Starting laptop prep on <COMPUTERNAME> ===`, and
+  `=== Prep phase complete ===` written *before* the upload, or the
+  server answers `422 not_a_prep_log` / files the device as incomplete.
+  Do not rebrand those two lines (see src/prep.h).
 * The upload address is not fixed at compile time.  It is taken from, in order:
   `LP_LOG_URL` in the environment, `url=` in `LaptopPrep.cfg` next to the exe,
   `HKCU\Software\Esprit ICT\LaptopPrep : LogUrl`, and last the `PREP_LOG_URL`

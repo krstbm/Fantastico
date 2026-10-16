@@ -167,7 +167,7 @@ static void usage(void)
     say("");
     say("  --all            everything the GUI runs by default");
     say("  --specs          CPU, RAM, Windows edition, disks");
-    say("  --devid          serials, UUID, MAC addresses (+ CSV)");
+    say("  --devid          serials, UUID, MAC addresses (into the log)");
     say("  --board          motherboard, BIOS");
     say("  --extra          GPU, memory modules, audio, network, USB");
     say("  --tpm            TPM status");

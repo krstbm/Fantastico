@@ -188,8 +188,8 @@ typedef struct {
 static const ModuleRow g_mods[] = {
     { PREP_M_SPECS,     "System specs & disks", "CPU, RAM, Windows edition, disk drives, volumes",
       "Writes CPU, RAM, OS build and every fixed disk to the log" },
-    { PREP_M_DEVICE_ID, "Device identity",      "Serials, UUID, MAC addresses + CSV export",
-      "One CSV row per laptop, ready for the asset database" },
+    { PREP_M_DEVICE_ID, "Device identity",      "Serials, UUID, MAC addresses",
+      "Written into the log's DEVICE ID section - that text is what the server parses" },
     { PREP_M_BOARD,     "Motherboard & BIOS",   "Board, BIOS revision, slots, buses",
       "Board and BIOS identity, plus the slot and bus inventory" },
     { PREP_M_EXTRA,     "Full hardware sweep",  "GPU, memory modules, audio, input, network, USB",
@@ -215,7 +215,7 @@ static int       g_view = VIEW_HOME;
 static int       g_dpi = 96;
 
 static int       g_runScreen = 0;
-static unsigned  g_selected = PREP_DEFAULT_FLAGS | PREP_M_UPLOAD;
+static unsigned  g_selected = PREP_DEFAULT_FLAGS;   /* includes upload, like esprit-ict.c */
 static volatile LONG g_step[NMOD];
 static volatile LONG g_active = -1;
 static int       g_finished = 0;
@@ -3474,7 +3474,7 @@ static const SettingRowDef g_settingRows[] = {
     { "Minimise the window when a run starts",
       "Useful when the laptop is left alone to work through the updates", 0, 201 },
     { "Open the log folder",
-      "C:\\RefurbLogs holds the log, the device CSV and the battery report", 1, 202 },
+      "C:\\RefurbLogs holds the log and the battery report", 1, 202 },
     { "Theme",
       "Stored in HKCU; follows Windows until you choose here", 0, 203 },
     { "Upload the log that is on disk right now",
@@ -3620,18 +3620,17 @@ static void paint_settings(HDC dc, Layout *L)
 
         lab[0] = "Log directory";   snprintf(val[0], sizeof(val[0]), "%s", prep_log_dir());
         lab[1] = "Log file";        snprintf(val[1], sizeof(val[1]), "%s", prep_log_path());
-        lab[2] = "Device CSV";      snprintf(val[2], sizeof(val[2]), "%s\\<COMPUTERNAME>_deviceID.csv", prep_log_dir());
-        lab[3] = "Battery report";  snprintf(val[3], sizeof(val[3]), "%s\\battery_report.html", prep_log_dir());
-        lab[4] = "Upload endpoint"; snprintf(val[4], sizeof(val[4]), "%s",
+        lab[2] = "Battery report";  snprintf(val[2], sizeof(val[2]), "%s\\battery_report.html", prep_log_dir());
+        lab[3] = "Upload endpoint"; snprintf(val[3], sizeof(val[3]), "%s",
                      prep_url_is_placeholder_ex() ? "(not configured - uploads are skipped)"
                                                   : prep_log_url_text());
-        lab[5] = "Engine modules";  snprintf(val[5], sizeof(val[5]), "%u", prep_module_count());
+        lab[4] = "Engine modules";  snprintf(val[4], sizeof(val[4]), "%u", prep_module_count());
         snprintf(buildline, sizeof(buildline), "%s  -  %s theme  -  engine %s",
                  PREP_VERSION_STR, g_themeDark ? "dark" : "light",
                  is_admin() ? "elevated" : "not elevated");
-        lab[6] = "Build";           snprintf(val[6], sizeof(val[6]), "%s", buildline);
+        lab[5] = "Build";           snprintf(val[5], sizeof(val[5]), "%s", buildline);
 
-        cardH = S(30) + 7 * S(20) + S(12);
+        cardH = S(30) + 6 * S(20) + S(12);
         if (y + cardH > L->content.bottom) {
             cardH = L->content.bottom - y;
             if (cardH < S(60)) return;
@@ -3639,7 +3638,7 @@ static void paint_settings(HDC dc, Layout *L)
         card(dc, x, y, w, cardH, P.surface, P.line, S(14));
         dtext(dc, "PATHS AND BUILD", x + S(18), y + S(9), S(200), S(16), P.muted,
               g_fTiny, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
-        for (k = 0; k < 7; k++) {
+        for (k = 0; k < 6; k++) {
             int ry = y + S(30) + k * S(20);
             if (ry + S(18) > y + cardH - S(4)) break;
             dtext(dc, lab[k], x + S(18), ry, lw, S(18), P.muted, g_fSmall,
@@ -3700,7 +3699,8 @@ static void paint_about(HDC dc, Layout *L)
     snprintf(buf, sizeof(buf),
         "Collects the hardware and software identity of a laptop that is being prepared for\r\n"
         "its next user, generates a battery report, finishes the Windows updates that are\r\n"
-        "already on the machine and writes everything into a single log file plus a CSV row.\r\n");
+        "already on the machine and writes everything into a single log file - the same\r\n"
+        "plain-text prep log esprit-ict.c uploads, which is the one file sent to the server.\r\n");
     dtext(dc, buf, x, y, w, S(70), P.text2, g_fBody,
           DT_LEFT | DT_TOP | DT_NOPREFIX);
 
