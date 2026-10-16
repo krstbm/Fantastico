@@ -171,6 +171,7 @@ typedef struct {
     int online_pending;         /* updates the service reported missing    */
     int agent_installed;        /* the agent installed something           */
     int install_failed;         /* the install attempt failed              */
+    long install_hresult;       /* why: the HResult of the first hard failure */
     int install_timed_out;
 
     /* services */

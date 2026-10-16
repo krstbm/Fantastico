@@ -34,6 +34,16 @@ Linux:     bash build.sh both (or: console, test)   with mingw-w64
 
 Both exes land in this folder next to assets/ and fonts/.
 
+Compiling is optional: LaptopPrep.exe and LaptopPrep-console.exe are already
+built and sit next to the sources.
+
+To build it yourself you need mingw-w64 (MSYS2: pacman -S
+mingw-w64-x86_64-toolchain, then use the "MSYS2 MINGW64" shell).  Both build
+scripts check the compiler first and stop with an explanation if it is a
+toolchain that cannot build this project - the old MinGW.org compiler
+(gcc -dumpmachine prints "mingw32", 32-bit, last released in 2018) has no
+WMI / WinHTTP / GDI+ headers, which is why it dies on wbemidl.h.
+
 ## First thing to read when it misbehaves
 
 The log's telemetry line, every 60 s while it runs:
@@ -43,10 +53,24 @@ The log's telemetry line, every 60 s while it runs:
 0 leaked handles + flat working set = the window is healthy. See
 docs/QUALITY-REPORT.md section 6 for the diagnostic switches.
 
+## Log, storage and upload
+
+* Every launch starts from a clean folder, the way the original esprit-ict tool
+  did: `C:\RefurbLogs` holds `<COMPUTERNAME>_prep.log`, `<COMPUTERNAME>_deviceID.csv`
+  and `battery_report.html`, and the previous run's copies of those three are
+  deleted before the new session writes anything - so the live log and the
+  upload describe this run only, and one laptop always has one set of files.
+* The upload address is not fixed at compile time.  It is taken from, in order:
+  `LP_LOG_URL` in the environment, `url=` in `LaptopPrep.cfg` next to the exe,
+  `HKCU\Software\Esprit ICT\LaptopPrep : LogUrl`, and last the `PREP_LOG_URL`
+  in src/prep.h.  Settings -> "Log upload server" shows the address in use and
+  where it came from, and lets it be typed in place (Enter saves to the cfg
+  file and the registry).  Every run writes it to the log as its first line.
+* Six threads do the read-only work - the five hardware queries, the battery
+  report and the update stage's opening survey - because those are independent.
+  The Windows Update *steps* stay in order: Windows installs one update at a
+  time.  `LP_POOL_THREADS` and `LP_NO_POOL=1` change it for testing.
+
 ## Still open
 
-* Every launch starts a clean log (the previous session is kept next to it as
-  `LaptopPrep-previous.log`); both the live log and the upload contain only the
-  current session.
-* The log-upload endpoint in src/prep.h (`PREP_LOG_URL`) is a placeholder.
 * Verified under Wine on Xvfb, not on real Windows hardware - see QUALITY-REPORT.md.

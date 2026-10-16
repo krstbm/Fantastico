@@ -172,6 +172,7 @@ enum { STEP_QUEUED = 0, STEP_RUNNING, STEP_OK, STEP_WARN, STEP_ERR, STEP_SKIP };
 #define WHAT_TITLE_MAX     401
 #define WHAT_TITLE_CLOSE   402
 #define WHAT_TITLE_THEME   403
+#define WHAT_NOTICE_CLOSE  310
 #define TB_BTNS            4
 
 /* ------------------------------------------------------------------ *
@@ -244,6 +245,13 @@ static float g_linkHov[2];
 static float g_btnHov[6];
 static float g_btnPress[6];
 static float g_titleHov[TB_BTNS];
+/* press flashes: the title-bar buttons and the Settings rows get the same
+ * "the click landed" beat the big buttons have, which matters most for the
+ * theme switch and for the rows that open the log folder or send the log -
+ * on those the window does not change, so the flash is the only answer
+ * until the work finishes */
+static float g_titlePress[TB_BTNS];
+static float g_rowPress[8];          /* the Settings rows, by their table index */
 static float g_ringPct;
 static float g_ringSpin;
 static float g_ringPulse;
@@ -342,6 +350,15 @@ static int  g_hoverNav = -1;
 static int  g_hoverModule = -1;
 static int  g_hoverBtn = -1;
 static int  g_hoverTitle = -1;
+
+/* the closable warning bar (see paint_notice) */
+static int   g_noticeOff  = 0;
+static float g_noticeFade = 1.0f;
+
+/* the in-place editor for the upload address (Settings) */
+static int  g_editRow   = -1;
+static char g_editBuf[512];
+static int  g_editCaret = 0;
 
 #define TITLE_H     36
 #define TB_BTN_W    46
@@ -1178,6 +1195,26 @@ static void titlebar_metrics(HWND hwnd, RECT *bar, RECT btn[TB_BTNS])
     }
 }
 
+/* titlebar_metrics() lays the buttons out right to left - index 0 is the
+ * rightmost one - and draw_title_glyph() draws the close cross there, then
+ * maximise, then minimise, then the theme switch.  So the id for an index
+ * is *not* WHAT_TITLE_MIN + index: mapping them the naive way made the X
+ * minimise the window and the dash close it. */
+static int title_what_for_index(int i)
+{
+    static const int map[TB_BTNS] = { WHAT_TITLE_CLOSE, WHAT_TITLE_MAX,
+                                      WHAT_TITLE_MIN,   WHAT_TITLE_THEME };
+    return (i >= 0 && i < TB_BTNS) ? map[i] : -1;
+}
+
+static int title_index_for_what(int what)
+{
+    int i;
+    for (i = 0; i < TB_BTNS; i++)
+        if (title_what_for_index(i) == what) return i;
+    return -1;
+}
+
 static void draw_theme_glyph(HDC dc, RECT r, int dark, int hovered)
 {
     int cx = (r.left + r.right) / 2, cy = (r.top + r.bottom) / 2, i;
@@ -1283,16 +1320,27 @@ static void paint_titlebar(HDC dc, HWND hwnd)
     }
 
     for (i = 0; i < TB_BTNS; i++) {
+        /* the wash colour follows the map, not the draw order: index 0 is
+         * the rightmost button and that one is the close cross, so it is
+         * the one that turns red under the mouse */
+        int what = title_what_for_index(i);
         float h = g_titleHov[i];
+        float pr = g_titlePress[i];
+        int dy = (int)(pr * S(2));            /* a 2 px shove while pressed */
         COLORREF bg = P.bg;
         if (h > 0.01f) {
-            COLORREF hi = (i == 2) ? P.bad : (i == 3) ? P.brandSoft : P.surfaceHi;
+            COLORREF hi = (what == WHAT_TITLE_CLOSE) ? P.bad
+                       : (what == WHAT_TITLE_THEME) ? P.brandSoft : P.surfaceHi;
             bg = blend(bg, hi, h);
         }
-        rrect(dc, btn[i].left + S(2), btn[i].top + S(5),
+        if (pr > 0.01f) bg = blend(bg, P.brandSoft, pr * 0.5f);
+        rrect(dc, btn[i].left + S(2), btn[i].top + S(5) + dy,
               (btn[i].right - btn[i].left) - S(4),
               (btn[i].bottom - btn[i].top) - S(10), S(8), bg,
-              (i == 3 && h > 0.01f) ? blend(P.bg, P.brandLine, h) : NOBORDER);
+              (what == WHAT_TITLE_THEME && h > 0.01f) ? blend(P.bg, P.brandLine, h)
+                                                      : NOBORDER);
+        fx_ripple_paint(dc, what, btn[i].left, btn[i].top,
+                        btn[i].right - btn[i].left, btn[i].bottom - btn[i].top);
         if (i < 3) draw_title_glyph(dc, i, h > 0.35f, maximized);
     }
     draw_theme_glyph(dc, btn[3], g_themeDark ? 1 : 0, g_titleHov[3] > 0.35f);
@@ -1464,7 +1512,7 @@ static void log_buf_append(const char *data, size_t len)
 static void log_pump_file(void)
 {
     HANDLE h = CreateFileA(prep_log_path(), GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
                            OPEN_EXISTING, 0, NULL);
     LARGE_INTEGER sz, off;
     char tmp[8192];
@@ -1649,6 +1697,8 @@ static int ui_needs_frame(void)
         if (g_wuCheck[i] > 0.001f && g_wuCheck[i] < 0.999f) return 1;
     if (g_restartDeadline) return 1;            /* the countdown ticks */
     if (g_scrollKick > 0.5f || g_scrollKick < -0.5f) return 1;
+    if (g_noticeOff && g_noticeFade > 0.02f) return 1;
+    if (g_editRow >= 0) return 1;               /* the caret blinks */
     for (i = 0; i < FX_RIPPLES; i++)
         if (g_ripples[i].active) return 1;
     for (i = 0; i < NMOD; i++)
@@ -1672,7 +1722,10 @@ static int ui_needs_frame(void)
     for (i = 0; i < 2; i++)
         if (g_linkHov[i] > 0.01f && g_linkHov[i] < 0.99f) return 1;
     for (i = 0; i < TB_BTNS; i++)
-        if (g_titleHov[i] > 0.01f && g_titleHov[i] < 0.99f) return 1;
+        if ((g_titleHov[i] > 0.01f && g_titleHov[i] < 0.99f) ||
+            g_titlePress[i] > 0.01f) return 1;
+    for (i = 0; i < 8; i++)
+        if (g_rowPress[i] > 0.01f) return 1;
     if (g_ringPct > 0.0f && g_ringPct < 99.9f) return 1;
     if (now - lastForced > 500) { lastForced = now; return 1; }
     return 0;
@@ -1700,8 +1753,12 @@ static void anim_tick(void)
     g_linkHov[1] = flerp(g_linkHov[1], (g_hoverBtn == WHAT_LINK_AGPCS) ? 1.0f : 0.0f, 0.30f);
     for (i = 0; i < 4; i++)
         g_btnPress[i] = flerp(g_btnPress[i], 0.0f, 0.12f);
-    for (i = 0; i < 3; i++)
+    for (i = 0; i < TB_BTNS; i++)
         g_titleHov[i] = flerp(g_titleHov[i], (g_hoverTitle == i) ? 1.0f : 0.0f, 0.32f);
+    for (i = 0; i < TB_BTNS; i++)
+        g_titlePress[i] = flerp(g_titlePress[i], 0.0f, 0.14f);
+    for (i = 0; i < 8; i++)
+        g_rowPress[i] = flerp(g_rowPress[i], 0.0f, 0.16f);
 
     g_ringPct = flerp(g_ringPct, (float)progress_pct(), g_finished ? 0.16f : 0.10f);
     if (g_runningNow()) g_ringSpin += 0.05f;
@@ -1736,6 +1793,10 @@ static void anim_tick(void)
     g_viewAnim = flerp(g_viewAnim, 1.0f, 0.16f);
     fx_tick();
     g_scrollAnim = flerp(g_scrollAnim, (float)g_logScroll + g_scrollKick, 0.30f);
+    if (g_noticeOff && g_noticeFade > 0.0f) {
+        g_noticeFade = flerp(g_noticeFade, 0.0f, 0.30f);
+        if (g_noticeFade < 0.02f) g_noticeFade = 0.0f;
+    }
     if (g_view == VIEW_LOG) g_logFade = flerp(g_logFade, 1.0f, 0.2f);
     else g_logFade = 0.0f;
 }
@@ -2155,17 +2216,58 @@ static void compute_layout(HWND hwnd, Layout *L)
 /* ------------------------------------------------------------------ *
  *  shared painters
  * ------------------------------------------------------------------ */
+/* The warning bar lives on every view - which is right until somebody has
+ * read it, so it now has a close cross.  Dismissing it collapses the bar
+ * instead of fading it: nothing in this interface is drawn with a partial
+ * alpha, and a height animation does not need one. */
+static int notice_rect(Layout *L, RECT *r)
+{
+    int y = L->content.bottom - S(70);
+    if (y < L->content.top + S(120)) return 0;
+    r->left   = L->content.left;
+    r->top    = y;
+    r->right  = L->content.left + L->cw;
+    r->bottom = y + S(26);
+    return 1;
+}
+
+static int notice_close_rect(Layout *L, RECT *r)
+{
+    RECT n;
+    if (!notice_rect(L, &n)) return 0;
+    r->right  = n.right - S(6);
+    r->left   = r->right - S(22);
+    r->top    = n.top + S(2);
+    r->bottom = n.bottom - S(2);
+    return 1;
+}
+
 static void paint_notice(HDC dc, Layout *L)
 {
     const char *n = prep_log_notice();
-    int y;
+    RECT r, c;
+    int h;
     if (!n || !n[0]) return;
-    y = L->content.bottom - S(70);
-    if (y < L->content.top + S(120)) return;
-    rrect(dc, L->content.left, y, L->cw, S(26), S(8), P.warnSoft, P.warnLine);
-    circle_fill(dc, L->content.left + S(16), y + S(13), S(3), P.warn, NOBORDER);
-    dtext(dc, n, L->content.left + S(26), y + S(4), L->cw - S(38), S(18), P.warn,
+    if (g_noticeOff && g_noticeFade < 0.02f) return;
+    if (!notice_rect(L, &r)) return;
+    h = (int)((float)S(26) * g_noticeFade);
+    if (h < 2) return;
+
+    rrect(dc, r.left, r.top, r.right - r.left, h, S(8), P.warnSoft, P.warnLine);
+    circle_fill(dc, r.left + S(16), r.top + h / 2, S(3), P.warn, NOBORDER);
+    dtext(dc, n, r.left + S(26), r.top + 4, (r.right - r.left) - S(72), S(18), P.warn,
           g_fTiny, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+
+    if (h > S(14) && notice_close_rect(L, &c)) {
+        int cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2, arm = S(4);
+        int t  = S(1) > 0 ? S(1) : 1;
+        int hot = (g_hoverBtn == WHAT_NOTICE_CLOSE);
+        COLORREF col = hot ? P.text : P.warn;
+        rrect(dc, c.left, c.top, c.right - c.left, c.bottom - c.top, S(6),
+              hot ? P.warnLine : P.warnSoft, NOBORDER);
+        stroke_line(dc, cx - arm, cy - arm, cx + arm, cy + arm, col, t);
+        stroke_line(dc, cx + arm, cy - arm, cx - arm, cy + arm, col, t);
+    }
 }
 
 static void paint_header(HDC dc, Layout *L, const char *title, const char *sub)
@@ -2634,6 +2736,12 @@ static void paint_home(HDC dc, Layout *L)
                     char es[40];
                     if (i == WU_S_AGENT)      snprintf(es, sizeof(es), "5-45 min");
                     else if (i == WU_S_INSTALL) snprintf(es, sizeof(es), "5-30 min");
+                    /* the orchestrator is the one step whose estimate is a
+                     * watch, not a call: two seconds to ask, up to 25 minutes
+                     * waiting for Windows to raise the restart flag.  Saying
+                     * "~2 min" there made a healthy long install look stuck -
+                     * measured on a real laptop: 28 minutes for the whole run. */
+                    else if (i == WU_S_ORCH)  snprintf(es, sizeof(es), "2-35 min");
                     else if (est < 60000u)    snprintf(es, sizeof(es), "~%us", est / 1000u);
                     else                      snprintf(es, sizeof(es), "~%u min", est / 60000u);
                     dtext_right(dc, es, rx + colw - S(70), ry, S(70), rh, P.muted,
@@ -3101,7 +3209,19 @@ static void paint_run(HDC dc, Layout *L)
                     const char *note = prep_update_step_note(i);
                     char nb[220];
                     long elms = prep_update_step_elapsed_ms(i);
-                    if (st == STEP_RUNNING && elms > 2000) {
+                    if (st == STEP_ERR && i == WU_S_INSTALL && note[0]) {
+                        /* name the code and the fix right on the row: this is
+                         * the row a technician actually has to act on */
+                        snprintf(nb, sizeof(nb), "%s", note);
+                        note = nb;
+                    } else if (st == STEP_RUNNING && i == WU_S_ORCH) {
+                        char t1[32];
+                        fmt_mmss(t1, sizeof(t1), elms);
+                        snprintf(nb, sizeof(nb),
+                                 "waiting for Windows to install - %s so far; it "
+                                 "stops early when nothing is queued", t1);
+                        note = nb;
+                    } else if (st == STEP_RUNNING && elms > 2000) {
                         char t1[32];
                         fmt_mmss(t1, sizeof(t1), elms);
                         snprintf(nb, sizeof(nb), "%s - %s so far", note, t1);
@@ -3226,8 +3346,11 @@ static void paint_log(HDC dc, Layout *L)
     g_logMaxScroll = (total > vis) ? (total - vis) : 0;
     if (!g_autoScroll) g_logFollow = 0;
     if (g_logFollow) {
-        g_logScroll = g_logMaxScroll;
-        g_scrollAnim = (float)g_logScroll;
+        /* follow = stay on the newest line, which is scroll 0 here (the
+         * old code pinned the view to the *top* of the log and then kept
+         * it there while new lines arrived below) */
+        g_logScroll = 0;
+        g_scrollAnim = 0.0f;
     }
     if (g_logScroll > g_logMaxScroll) g_logScroll = g_logMaxScroll;
     if (g_logScroll < 0) g_logScroll = 0;
@@ -3339,63 +3462,94 @@ static void paint_log(HDC dc, Layout *L)
 typedef struct {
     const char *title;
     const char *desc;
-    int   kind;         /* 0 toggle, 1 action */
-    int   on;
-    int   id;
-} SettingRow;
+    int         kind;   /* 0 toggle, 1 action, 2 editable text */
+    int         id;
+} SettingRowDef;
+
+/* One table, used by the painter *and* the hit test, so a click can never
+ * land on a different row than the one that was drawn. */
+static const SettingRowDef g_settingRows[] = {
+    { "Auto-follow the live log while a run is in progress",
+      "The log keeps scrolling to the newest line unless you scroll up", 0, 200 },
+    { "Minimise the window when a run starts",
+      "Useful when the laptop is left alone to work through the updates", 0, 201 },
+    { "Open the log folder",
+      "C:\\RefurbLogs holds the log, the device CSV and the battery report", 1, 202 },
+    { "Theme",
+      "Stored in HKCU; follows Windows until you choose here", 0, 203 },
+    { "Upload the log that is on disk right now",
+      "For after a reboot, when the run is finished but the upload is unsure", 1, 204 },
+    { "Log upload server",
+      "Click to type the address, Enter to save - it is written to LaptopPrep.cfg "
+      "next to the console so every laptop can share it", 2, 207 },
+    { "Fix a stuck Windows Update (runs fix-windows-update.bat as admin)",
+      "Restarts the update services and clears a wedged session - keeps downloads", 1, 205 },
+    { "Open Settings > Windows Update",
+      "Hand the machine to the built-in updater when a person should look", 1, 206 },
+};
+#define N_SETTING_ROWS ((int)(sizeof(g_settingRows) / sizeof(g_settingRows[0])))
+
+static int setting_row_index_for_id(int id)
+{
+    int i;
+    for (i = 0; i < N_SETTING_ROWS; i++)
+        if (g_settingRows[i].id == id) return i;
+    return -1;
+}
+
+static int setting_row_on(int id)
+{
+    if (id == 200) return g_autoScroll;
+    if (id == 201) return g_minimizeOnRun;
+    if (id == 203) return g_themeDark;
+    return 0;
+}
+
+static int setting_row_rect(Layout *L, int i, RECT *r)
+{
+    int y = L->content.top + S(96);
+    r->left = L->content.left;
+    r->top = y + i * (S(48) + S(8));
+    r->right = L->content.left + L->cw;
+    r->bottom = r->top + S(48);
+    return (r->bottom <= L->content.bottom - S(150));
+}
 
 static void paint_settings(HDC dc, Layout *L)
 {
-    int x = L->content.left, y = L->content.top + S(96);
     int w = L->cw;
-    int i;
-    SettingRow rows[7];
+    int i, nrows = N_SETTING_ROWS;
     char buildline[128];
 
     paint_header(dc, L, "Settings", "Small quality-of-life options for this console.");
 
-    memset(rows, 0, sizeof(rows));
-    rows[0].title = "Auto-follow the live log while a run is in progress";
-    rows[0].desc  = "The log keeps scrolling to the newest line unless you scroll up";
-    rows[0].kind = 0; rows[0].on = g_autoScroll;   rows[0].id = 200;
-    rows[1].title = "Minimise the window when a run starts";
-    rows[1].desc  = "Useful when the laptop is left alone to work through the updates";
-    rows[1].kind = 0; rows[1].on = g_minimizeOnRun; rows[1].id = 201;
-    rows[2].title = "Open the log folder";
-    rows[2].desc  = "C:\\RefurbLogs holds the log, the device CSV and the battery report";
-    rows[2].kind = 1; rows[2].id = 202;
-    rows[3].title = "Theme";
-    rows[3].desc  = "Stored in HKCU; follows Windows until you choose here";
-    rows[3].kind = 0; rows[3].on = g_themeDark;     rows[3].id = 203;
-    rows[4].title = "Upload the log that is on disk right now";
-    rows[4].desc  = "For after a reboot, when the run is finished but the upload is unsure";
-    rows[4].kind = 1; rows[4].id = 204;
-    rows[5].title = "Fix a stuck Windows Update (runs fix-windows-update.bat as admin)";
-    rows[5].desc  = "Restarts the update services and clears a wedged session - keeps downloads";
-    rows[5].kind = 1; rows[5].id = 205;
-    rows[6].title = "Open Settings > Windows Update";
-    rows[6].desc  = "Hand the machine to the built-in updater when a person should look";
-    rows[6].kind = 1; rows[6].id = 206;
-
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < nrows; i++) {
         RECT r;
-        int hov, rowH = S(48), gap = S(8);
-        r.left = x; r.top = y + i * (rowH + gap);
-        r.right = x + w; r.bottom = r.top + rowH;
-        if (r.bottom > L->content.bottom - S(150)) break;
-        hov = (g_hoverModule == rows[i].id);
-        card(dc, r.left, r.top, r.right - r.left, r.bottom - r.top,
-             hov ? P.surfaceHi : P.surface,
+        int hov, rowH = S(48);
+        const SettingRowDef *row = &g_settingRows[i];
+        if (!setting_row_rect(L, i, &r)) { nrows = i; break; }
+        hov = (g_hoverModule == row->id);
+        card(dc, r.left, r.top + (int)(g_rowPress[i] * S(1)), r.right - r.left, r.bottom - r.top,
+             g_rowPress[i] > 0.01f ? blend(hov ? P.surfaceHi : P.surface, P.brandSoft,
+                                           g_rowPress[i] * 0.55f)
+                                   : (hov ? P.surfaceHi : P.surface),
              blend(P.line, hov ? P.brandLine : P.lineHi, hov ? 1.0f : 0.0f), S(12));
         if (hov) shadow_card(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, S(12));
-        fx_ripple_paint(dc, rows[i].id, r.left, r.top, r.right - r.left, rowH);
+        fx_ripple_paint(dc, row->id, r.left, r.top, r.right - r.left, rowH);
 
-        if (rows[i].kind == 0) {
-            int on = rows[i].on;
+        if (row->kind == 0) {
+            int on = setting_row_on(row->id);
             rrect(dc, r.left + S(18), r.top + (rowH - S(22)) / 2, S(22), S(22), S(7),
                   on ? P.brand : P.surfaceHi, on ? P.brand : P.line);
             if (on) check_mark(dc, r.left + S(29), r.top + rowH / 2, S(5), P.onBrand,
                                S(2) > 1 ? S(2) : 1);
+        } else if (row->kind == 2) {
+            /* a pen glyph: this row takes typing, not a click-and-run */
+            int cx = r.left + S(29), cy = r.top + rowH / 2;
+            circle_fill(dc, cx, cy, S(11), P.brandSoft, P.brandLine);
+            stroke_line(dc, cx - S(4), cy + S(4), cx + S(2), cy - S(2), P.brand, S(2) > 1 ? S(2) : 1);
+            stroke_line(dc, cx + S(2), cy - S(2), cx + S(4), cy - S(4), P.brand, S(2) > 1 ? S(2) : 1);
+            stroke_line(dc, cx - S(5), cy + S(5), cx - S(2), cy + S(4), P.brand, S(2) > 1 ? S(2) : 1);
         } else {
             /* action rows get an arrow glyph */
             int cx = r.left + S(29), cy = r.top + rowH / 2;
@@ -3405,39 +3559,64 @@ static void paint_settings(HDC dc, Layout *L)
             stroke_line(dc, cx + S(1), cy + S(4), cx + S(4), cy, P.brand, S(2) > 1 ? S(2) : 1);
         }
 
-        dtext(dc, rows[i].title, r.left + S(52), r.top + S(8), w - S(220), S(20),
+        dtext(dc, row->title, r.left + S(52), r.top + S(8), w - S(220), S(20),
               P.text, g_fBody,
               DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-        dtext(dc, rows[i].desc, r.left + S(52), r.top + S(27), w - S(220), S(16),
-              P.muted, g_fTiny,
-              DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
 
-        if (rows[i].kind == 0) {
-            const char *st = rows[i].on ? "on" : "off";
-            int cw = chip_w(dc, st, g_fTiny);
-            chip(dc, r.right - cw - S(16), r.top + (rowH - S(20)) / 2, st,
-                 rows[i].on ? P.good : P.muted,
-                 rows[i].on ? P.goodSoft : P.surfaceHi,
-                 rows[i].on ? blend(P.goodSoft, P.good, 0.45f) : P.line, g_fTiny);
+        if (row->kind == 2) {
+            if (g_editRow == row->id) {
+                /* the value being typed, with a caret that blinks */
+                int show = ((GetTickCount() / 500) % 2) == 0;
+                char shown[560];
+                snprintf(shown, sizeof(shown), "%s%s", g_editBuf, show ? "|" : " ");
+                dtext(dc, shown, r.left + S(52), r.top + S(27), w - S(220), S(16),
+                      P.brand, g_fTiny,
+                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            } else {
+                char shown[560];
+                snprintf(shown, sizeof(shown), "%s   (from %s)",
+                         prep_log_url(), prep_log_url_source());
+                dtext(dc, shown, r.left + S(52), r.top + S(27), w - S(220), S(16),
+                      prep_url_is_placeholder_ex() ? P.warn : P.muted, g_fTiny,
+                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+            }
         } else {
-            const char *st = (i == 4)
-                ? (prep_url_is_placeholder_ex() ? "no endpoint" : "send")
-                : "run";
-            int cw = chip_w(dc, st, g_fTiny);
-            int ok = (i != 4) || !prep_url_is_placeholder_ex();
+            dtext(dc, row->desc, r.left + S(52), r.top + S(27), w - S(220), S(16),
+                  P.muted, g_fTiny,
+                  DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+
+        {
+            const char *st;
+            int okchip;
+            int cw;
+            if (row->kind == 0) {
+                st = setting_row_on(row->id) ? "on" : "off";
+                okchip = setting_row_on(row->id);
+            } else if (row->kind == 2) {
+                if (g_editRow == row->id)      { st = "enter saves"; okchip = 1; }
+                else if (prep_url_is_placeholder_ex()) { st = "set address"; okchip = 0; }
+                else                            { st = "change"; okchip = 1; }
+            } else {
+                st = (row->id == 204 && !prep_url_is_placeholder_ex()) ? "send" : "run";
+                okchip = (row->id != 204) || !prep_url_is_placeholder_ex();
+            }
+            cw = chip_w(dc, st, g_fTiny);
             chip(dc, r.right - cw - S(16), r.top + (rowH - S(20)) / 2, st,
-                 ok ? P.brand : P.muted,
-                 ok ? P.brandSoft : P.surfaceHi,
-                 ok ? P.brandLine : P.line, g_fTiny);
+                 okchip ? P.brand : P.muted,
+                 okchip ? P.brandSoft : P.surfaceHi,
+                 okchip ? P.brandLine : P.line, g_fTiny);
         }
     }
+    (void)nrows;
 
     /* ---- paths ------------------------------------------------------ */
-    y += 7 * (S(48) + S(8)) + S(6);
     {
         const char *lab[7];
         char val[7][MAX_PATH + 64];
         int k, lw = S(130), cardH;
+        int x = L->content.left;
+        int y = L->content.top + S(96) + nrows * (S(48) + S(8)) + S(6);
 
         lab[0] = "Log directory";   snprintf(val[0], sizeof(val[0]), "%s", prep_log_dir());
         lab[1] = "Log file";        snprintf(val[1], sizeof(val[1]), "%s", prep_log_path());
@@ -4213,13 +4392,18 @@ static int hit_test(POINT p, Layout *L, int *what)
         for (i = 0; i < TB_BTNS; i++)
             if (point_in(p.x, p.y, tbtn[i].left, tbtn[i].top,
                          tbtn[i].right - tbtn[i].left, tbtn[i].bottom - tbtn[i].top)) {
-                *what = WHAT_TITLE_MIN + i;
+                *what = title_what_for_index(i);
                 return 1;
             }
     }
     if (g_view == VIEW_ABOUT && L->linkWintr.right > L->linkWintr.left) {
         if (in_rect(p.x, p.y, L->linkWintr)) { *what = WHAT_LINK_WINTR; return 1; }
         if (in_rect(p.x, p.y, L->linkAgpcs)) { *what = WHAT_LINK_AGPCS; return 1; }
+    }
+    {
+        RECT nc;
+        if (!g_noticeOff && notice_close_rect(L, &nc) &&
+            in_rect(p.x, p.y, nc)) { *what = WHAT_NOTICE_CLOSE; return 1; }
     }
     if (g_restartOffered && L->btnRestart.right > L->btnRestart.left) {
         if (in_rect(p.x, p.y, L->btnRestart))     { *what = WHAT_BTN_RESTART;      return 1; }
@@ -4245,13 +4429,11 @@ static int hit_test(POINT p, Layout *L, int *what)
         for (i = 0; i < 3; i++)
             if (in_rect(p.x, p.y, L->btnLog[i])) { *what = 300 + i; return 1; }
     } else if (g_view == VIEW_SETTINGS) {
-        int x = L->content.left, y = L->content.top + S(96);
-        int w = L->cw;
-        for (i = 0; i < 7; i++)
-            if (point_in(p.x, p.y, x, y + i * (S(48) + S(8)), w, S(48))) {
-                *what = 200 + i;
-                return 1;
-            }
+        RECT r;
+        for (i = 0; i < N_SETTING_ROWS; i++) {
+            if (!setting_row_rect(L, i, &r)) break;
+            if (in_rect(p.x, p.y, r)) { *what = g_settingRows[i].id; return 1; }
+        }
     }
     return 0;
 }
@@ -4390,9 +4572,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 } else if (what >= 200 && what < 300) {
                     if (g_hoverModule != what) { g_hoverModule = what; redraw = 1; }
                 } else if (what >= WHAT_TITLE_MIN && what <= WHAT_TITLE_THEME) {
-                    if (g_hoverTitle != what - WHAT_TITLE_MIN) {
-                        g_hoverTitle = what - WHAT_TITLE_MIN; redraw = 1;
-                    }
+                    int ti = title_index_for_what(what);
+                    if (g_hoverTitle != ti) { g_hoverTitle = ti; redraw = 1; }
                 } else if (what >= 0 && what < NMOD) {
                     if (g_hoverModule != what) { g_hoverModule = what; redraw = 1; }
                 } else {
@@ -4465,6 +4646,8 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (what >= 100 && what < 100 + VIEW_COUNT) g_navPress[what - 100] = 1.0f;
 
                 if (what >= WHAT_TITLE_MIN && what <= WHAT_TITLE_THEME) {
+                    int ti = title_index_for_what(what);
+                    if (ti >= 0) g_titlePress[ti] = 1.0f;
                     if (what == WHAT_TITLE_MIN)  ShowWindow(hwnd, SW_MINIMIZE);
                     if (what == WHAT_TITLE_MAX)  ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
                     if (what == WHAT_TITLE_CLOSE) PostMessageA(hwnd, WM_CLOSE, 0, 0);
@@ -4511,12 +4694,27 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     } else {
                         start_run();
                     }
+                } else if (what == WHAT_NOTICE_CLOSE) {
+                    RECT nc;
+                    g_noticeOff = 1;
+                    if (notice_close_rect(&L, &nc))
+                        fx_ripple_spawn(WHAT_NOTICE_CLOSE,
+                                        (nc.left + nc.right) / 2,
+                                        (nc.top + nc.bottom) / 2, P.warn);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
                 } else if (what >= 300 && what < 400) {
                     if (what == 300) log_copy_all();
                     if (what == 301) open_logdir();
-                    if (what == 302) g_logFollow = !g_logFollow;
+                    if (what == 302) {
+                        g_logFollow = !g_logFollow;
+                        if (g_logFollow) g_logScroll = 0;
+                    }
                 } else if (what >= 200 && what < 300) {
-                    if (what == 200) g_autoScroll = !g_autoScroll;
+                    if (what == 200) {
+                        g_autoScroll = !g_autoScroll;
+                        if (g_autoScroll) { g_logScroll = 0; g_logFollow = 1; }
+                    }
                     if (what == 201) g_minimizeOnRun = !g_minimizeOnRun;
                     if (what == 202) open_logdir();
                     if (what == 203) {
@@ -4526,7 +4724,7 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         theme_brushes();
                     }
                     if (what == 204) {
-                        int configured, up;
+                        int configured, up, http;
                         configured = !prep_url_is_placeholder_ex();
                         snprintf(g_status, sizeof(g_status),
                                  configured ? "Uploading the log..." :
@@ -4534,13 +4732,41 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         InvalidateRect(hwnd, NULL, TRUE);
                         UpdateWindow(hwnd);
                         up = configured ? log_upload(prep_log_path()) : 0;
-                        snprintf(g_status, sizeof(g_status),
-                                 configured ? (up ? "Log uploaded - it is on the server."
-                                                  : "Upload failed - the log is still on disk.")
-                                            : "No upload endpoint configured - nothing sent.");
+                        http = prep_last_upload_http();
+                        if (!configured)
+                            snprintf(g_status, sizeof(g_status),
+                                     "No upload endpoint configured - set the address in "
+                                     "the row below.");
+                        else if (up)
+                            snprintf(g_status, sizeof(g_status),
+                                     "Log uploaded - the server answered HTTP %d.", http);
+                        else if (http > 0)
+                            snprintf(g_status, sizeof(g_status),
+                                     "The server refused the upload (HTTP %d) - the log is "
+                                     "still on disk and still in the log folder.", http);
+                        else
+                            snprintf(g_status, sizeof(g_status),
+                                     "No answer from %s - check the address and the "
+                                     "network; the log is still on disk.", prep_log_url());
                         write_log(configured && up ? "Manual upload: OK"
                                                    : "Manual upload: not sent");
                         log_pump_file();
+                    }
+                    {
+                        int ri = setting_row_index_for_id(what);
+                        if (ri >= 0) g_rowPress[ri] = 1.0f;
+                    }
+                    if (what == 207) {
+                        /* start editing the server address in place */
+                        strncpy(g_editBuf, prep_log_url(), sizeof(g_editBuf) - 1);
+                        g_editBuf[sizeof(g_editBuf) - 1] = 0;
+                        g_editCaret = (int)strlen(g_editBuf);
+                        g_editRow = 207;
+                        SetFocus(hwnd);
+                        snprintf(g_status, sizeof(g_status),
+                                 "Type the address your server listens on, then press Enter "
+                                 "(Esc cancels).");
+                        InvalidateRect(hwnd, NULL, FALSE);
                     }
                     if (what == 205) run_update_recovery();
                     if (what == 206) open_windows_update();
@@ -4580,6 +4806,39 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
 
+        case WM_CHAR:
+            if (g_editRow >= 0) {
+                unsigned ch = (unsigned)wp;
+                if (ch == 27) {                                  /* Esc: cancel */
+                    g_editRow = -1;
+                    snprintf(g_status, sizeof(g_status), "Left the address as it was.");
+                } else if (ch == 13 || ch == 10) {               /* Enter: save */
+                    char saved[640];
+                    if (prep_log_url_set(g_editBuf)) {
+                        snprintf(saved, sizeof(saved), "Upload server set to %s",
+                                 prep_log_url());
+                        write_log(saved);
+                        snprintf(g_status, sizeof(g_status),
+                                 "Saved. Every upload from now on goes to %s.",
+                                 prep_log_url());
+                    } else {
+                        snprintf(g_status, sizeof(g_status),
+                                 "That is not an http:// or https:// address - nothing saved.");
+                    }
+                    g_editRow = -1;
+                    log_pump_file();
+                } else if (ch == 8) {                            /* backspace */
+                    if (g_editCaret > 0) g_editBuf[--g_editCaret] = 0;
+                } else if (ch >= 32 && ch < 127 &&
+                           g_editCaret < (int)sizeof(g_editBuf) - 1) {
+                    g_editBuf[g_editCaret++] = (char)ch;
+                    g_editBuf[g_editCaret] = 0;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            return 0;
+
         case WM_MOUSEWHEEL:
         {
             int delta = GET_WHEEL_DELTA_WPARAM(wp);
@@ -4590,11 +4849,18 @@ static LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             ScreenToClient(hwnd, &p);
             compute_layout(hwnd, &L);
             if (g_view == VIEW_LOG && in_rect(p.x, p.y, L.logArea)) {
-                g_logScroll += (delta > 0) ? 3 : -3;
-                g_scrollKick += (delta > 0) ? -S(14) : S(14);
+                /* g_logScroll counts how far *back* from the live tail the
+                 * view sits: 0 shows the newest line.  Wheel up = further
+                 * back through history, wheel down = back toward the tail.
+                 * The kick overshoots in the direction of travel - it used
+                 * to overshoot the other way, which made a downward scroll
+                 * jump upwards first and then drop back, and follow used to
+                 * switch on at the wrong end of the log. */
+                if (delta > 0) { g_logScroll += 3; g_scrollKick += S(14); }
+                else           { g_logScroll -= 3; g_scrollKick -= S(14); }
                 if (g_logScroll < 0) g_logScroll = 0;
                 if (g_logScroll > g_logMaxScroll) g_logScroll = g_logMaxScroll;
-                g_logFollow = (g_logScroll >= g_logMaxScroll);
+                g_logFollow = (g_logScroll <= 0);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
@@ -4715,14 +4981,40 @@ static void enable_dpi_awareness(void)
     SetProcessDPIAware();
 }
 
+/* ------------------------------------------------------------------ *
+ *  entry point
+ *
+ *  mingw-w64 provides the Unicode entry point (wWinMain + -municode).
+ *  The older MinGW.org toolchain and Cygwin's gcc do not: they only know
+ *  WinMain, and they reject -municode with "unrecognized command line
+ *  option".  So the real entry is lp_main() and the two wrappers below
+ *  pick the one the toolchain has.  build.bat probes for -municode and
+ *  defines LP_ANSI_ENTRY when it is missing; nothing else changes,
+ *  because the wide command line is available either way.
+ * ------------------------------------------------------------------ */
+static int lp_main(HINSTANCE hInst, int show);
+
+#ifdef LP_ANSI_ENTRY
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
+{
+    (void)hPrev; (void)cmd;                 /* GetCommandLineW() still works */
+    return lp_main(hInst, show);
+}
+#else
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR cmd, int show)
+{
+    (void)hPrev; (void)cmd;
+    return lp_main(hInst, show);
+}
+#endif
+
+static int lp_main(HINSTANCE hInst, int show)
 {
     WNDCLASSA wc;
     MSG msg;
     HICON icon;
     int w = 1320, h = 880;
     RECT wa, wr;
-    (void)hPrev; (void)cmd;
 
     enable_dpi_awareness();
     {

@@ -82,6 +82,16 @@ extern "C" {
 #define PREP_WU_USO_SCAN_WAIT_MS     (10u  * 60u * 1000u) /* orchestrator: did  */
 #define PREP_WU_USO_DOWNLOAD_WAIT_MS (25u  * 60u * 1000u) /* anything happen?   */
 #define PREP_WU_USO_INSTALL_WAIT_MS  (25u  * 60u * 1000u)
+
+/*  Idle budgets for the two orchestrator watches.  When the machine shows
+ *  no sign of work at all - no payload moving, no restart requirement -
+ *  the watch stops after these short budgets instead of the full ones
+ *  above, and the full budget applies again the moment anything moves.
+ *  A machine that already has its updates used to sit out the whole
+ *  10-minute scan watch and then the whole 25-minute install watch with
+ *  nothing happening at either end. */
+#define PREP_WU_ORCH_IDLE_MS         (2u  * 60u * 1000u)  /* scan watch      */
+#define PREP_WU_DL_IDLE_MS           (3u  * 60u * 1000u)  /* install watch   */
 #define PREP_WU_PAYLOAD_TIMEOUT_MS   (45u  * 60u * 1000u) /* one .msu / .cab    */
 #define PREP_WU_DISM_TIMEOUT_MS      (25u  * 60u * 1000u) /* DISM repair        */
 #define PREP_WU_FIX_TIMEOUT_MS       (30u  * 60u * 1000u) /* fix-windows-update */
@@ -113,14 +123,13 @@ extern "C" {
 #define PREP_ALL_FLAGS     (PREP_DEFAULT_FLAGS | PREP_M_UPLOAD)
 
 /* ---- where everything is written ------------------------------- *
- *  PREP_LOGDIR is taken relative to the directory the executable    *
- *  lives in when it is not an absolute path, so the log always      *
- *  lands at <exe dir>\docs\examples\example.log no matter the cwd.  *
- *  If that folder is not writable the engine falls back to          *
- *  %%LOCALAPPDATA%%\LaptopPrep and then %%TEMP%%\LaptopPrep.        *
- * ---------------------------------------------------------------- */
-#define PREP_LOGDIR  "docs\\examples"
-#define PREP_LOGFILE "example.log"
+ *  The log is named after the machine, exactly like the esprit-ict
+ *  tool: C:\RefurbLogs\<COMPUTERNAME>_prep.log, next to
+ *  <COMPUTERNAME>_deviceID.csv and battery_report.html.  A folder that
+ *  collects logs from fifty laptops can then tell them apart, and the
+ *  three files of one machine always sit together. */
+#define PREP_LOGDIR          "C:\\RefurbLogs"
+#define PREP_LOGFILE_SUFFIX  "_prep.log"
 
 /* ---- engine entry points (implemented in prep_core.c) ---------- */
 
@@ -213,6 +222,21 @@ int  run_process_logged(const char *cmdline, int timeoutMs, DWORD *exitcode);
 /* Log endpoint helpers (read PREP_LOG_URL at run time - deliberately not
  * compile-time constants, so the upload code is never optimised away) */
 int         prep_url_is_placeholder_ex(void);
+
+/* Where the finished log is posted.  The address can be set without a
+ * rebuild: LP_LOG_URL in the environment, a "url=" line in LaptopPrep.cfg
+ * next to the exe, or HKCU\Software\LaptopPrep : LogUrl - in that order,
+ * with the compiled-in PREP_LOG_URL as the fallback. */
+const char *prep_log_url(void);
+const char *prep_log_url_source(void);
+int         prep_log_url_set(const char *url);
+
+/* HTTP status of the most recent upload attempt:
+ *   > 0  the server answered with that code
+ *   -1   no answer at all (DNS, TLS, timeout, no network)
+ *   -2   nothing was sent (no endpoint configured, or the log was empty)
+ *    0   no attempt yet. */
+int         prep_last_upload_http(void);
 const char *prep_log_url_text(void);
 
 /* ---------------------------------------------------------------- *

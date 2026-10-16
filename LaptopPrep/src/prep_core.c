@@ -84,7 +84,8 @@ static char g_logNotice[320];
 static void log_paths_for(const char *dir)
 {
     snprintf(g_logDir,    sizeof(g_logDir),    "%s", dir);
-    snprintf(g_logPath,   sizeof(g_logPath),   "%s\\%s",                    dir, PREP_LOGFILE);
+    snprintf(g_logPath,   sizeof(g_logPath),   "%s\\%s%s",                  dir, g_computer,
+                                                               PREP_LOGFILE_SUFFIX);
     snprintf(g_deviceCsv, sizeof(g_deviceCsv), "%s\\%s_deviceID.csv",       dir, g_computer);
     snprintf(g_battHtml,  sizeof(g_battHtml),  "%s\\battery_report.html",   dir);
 }
@@ -98,71 +99,87 @@ static int log_dir_works(const char *dir)
     char path[MAX_PATH];
     FILE *f;
     CreateDirectoryA(dir, NULL);
-    snprintf(path, sizeof(path), "%s\\%s", dir, PREP_LOGFILE);
-    f = fopen(path, "ab");
+    /* A temp name on purpose: testing with the real log name created an
+     * empty log file, which the clean-up below then had to delete - and
+     * every single run reported "Deleted 1 old refurb log file" because
+     * of it. */
+    snprintf(path, sizeof(path), "%s\\LaptopPrep-write-test.tmp", dir);
+    f = fopen(path, "wb");
     if (!f) return 0;
     fclose(f);
+    DeleteFileA(path);
     return 1;
 }
 
-/* Every launch starts a clean log.  The previous session is moved aside
- * to LaptopPrep-previous.log (one file, overwritten each time) instead of
- * being thrown away, so the live log and anything uploaded to the server
- * describe this session only - while yesterday's run is still recoverable
- * next to it.  If the file cannot be moved or deleted (locked by another
- * copy of the program, or a read-only log left by an elevated run), the
- * old behaviour of appending is kept and the note says so. */
-static void log_start_fresh(void)
+/* Start every run from a clean folder, the way the esprit-ict tool did:
+ * the machine's own <COMPUTER>_prep.log, <COMPUTER>_deviceID.csv and
+ * battery_report.html from the previous run are deleted before this
+ * session writes anything.  So the live log and the uploaded log describe
+ * this run only, and nothing piles up in the log folder.  A file that
+ * cannot be deleted (another copy of the program has it open) is left
+ * alone, and the note says so rather than pretending it worked. */
+static int delete_old_files(const char *pattern, int *failed)
 {
-    char prev[MAX_PATH];
-    if (GetFileAttributesA(g_logPath) == INVALID_FILE_ATTRIBUTES) return;  /* nothing there */
-    snprintf(prev, sizeof(prev), "%s\\%s-previous.log", g_logDir, "LaptopPrep");
-    if (MoveFileExA(g_logPath, prev, MOVEFILE_REPLACE_EXISTING)) return;
-    if (DeleteFileA(g_logPath)) return;
-    snprintf(g_logNotice, sizeof(g_logNotice),
-             "the previous log could not be cleared (%s) - this session will "
-             "be appended to it; close the other copy of LaptopPrep and start "
-             "again for a clean log", g_logPath);
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    char full[MAX_PATH];
+    int n = 0;
+    h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        int try;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        snprintf(full, sizeof(full), "%s\\%s", g_logDir, fd.cFileName);
+        /* Another copy of the console can have the file open for a moment
+         * (the live log view reads it in a loop).  Four tries over half a
+         * second beats a warning the operator cannot act on. */
+        for (try = 0; try < 4; try++) {
+            if (DeleteFileA(full)) { n++; break; }
+            Sleep(120);
+        }
+        if (try == 4 && failed) (*failed)++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
 }
 
-/* Resolve the configured log directory.  When PREP_LOGDIR is a relative
- * path (e.g. "docs\examples") it is taken relative to the directory the
- * executable lives in, so the log always lands at
- * <exe dir>\docs\examples\example.log no matter what the current
- * directory is.  Absolute paths (a drive letter or a UNC share) are used
- * as-is. */
-static void log_dir_resolve(const char *rel, char *out, size_t outsz)
+static int clean_old_logs(void)
 {
-    char exe[MAX_PATH];
-    DWORD len, i;
-
-    if ((rel[0] && rel[1] == ':') || (rel[0] == '\\' && rel[1] == '\\')) {
-        snprintf(out, outsz, "%s", rel);
-        return;
+    char pat[MAX_PATH];
+    char note[220];
+    int failed = 0, total = 0;
+    snprintf(pat, sizeof(pat), "%s\\*_prep.log", g_logDir);
+    total += delete_old_files(pat, &failed);
+    snprintf(pat, sizeof(pat), "%s\\*_deviceID.csv", g_logDir);
+    total += delete_old_files(pat, &failed);
+    snprintf(pat, sizeof(pat), "%s\\battery_report.html", g_logDir);
+    total += delete_old_files(pat, &failed);
+    if (failed) {
+        snprintf(note, sizeof(note),
+                 "%d old log file(s) could not be removed - another copy of "
+                 "LaptopPrep may have them open; this session is appended to "
+                 "what is left", failed);
+        if (g_logNotice[0]) {
+            size_t used = strlen(g_logNotice);
+            snprintf(g_logNotice + used, sizeof(g_logNotice) - used, "; %s", note);
+        } else {
+            snprintf(g_logNotice, sizeof(g_logNotice), "%s", note);
+        }
     }
-    len = GetModuleFileNameA(NULL, exe, MAX_PATH);
-    if (!len || len >= MAX_PATH) { snprintf(out, outsz, "%s", rel); return; }
-    for (i = len; i > 0; i--)
-        if (exe[i - 1] == '\\' || exe[i - 1] == '/') break;
-    exe[i ? i - 1 : 0] = 0;
-    snprintf(out, outsz, "%s\\%s", exe, rel);
+    return total;
 }
 
 void prep_init(void)
 {
     DWORD sz;
-    char logDir[MAX_PATH];
     g_logMx = CreateMutexA(NULL, FALSE, "LaptopPrep_log_mutex");
     sz = (DWORD)sizeof(g_computer);
     GetComputerNameA(g_computer, &sz);
     g_logNotice[0] = 0;
 
-    log_dir_resolve(PREP_LOGDIR, logDir, sizeof(logDir));
-    log_paths_for(logDir);
+    log_paths_for(PREP_LOGDIR);
 
-    log_start_fresh();
-
-    if (!log_dir_works(logDir)) {
+    if (!log_dir_works(PREP_LOGDIR)) {
         char alt[MAX_PATH];
         int done = 0;
         alt[0] = 0;
@@ -188,6 +205,27 @@ void prep_init(void)
                      "No writable log folder found (tried %s, %%LOCALAPPDATA%% and %%TEMP%%)",
                      PREP_LOGDIR);
         }
+    }
+
+    /* Clean slate, like the reference tool: one machine, one set of files.
+     * This runs after the folder above is settled, so it cleans the folder
+     * the run will actually use. */
+    {
+        int removed = clean_old_logs();
+        if (removed > 0) {
+            char b[128];
+            snprintf(b, sizeof(b), "Deleted %d old refurb log file(s)", removed);
+            write_log(b);
+        } else {
+            write_log("No old refurb logs found");
+        }
+    }
+
+    {
+        char b[640];
+        snprintf(b, sizeof(b), "Upload endpoint: %s  (from %s)",
+                 (const char*)prep_log_url(), prep_log_url_source());
+        write_log(b);
     }
 }
 
@@ -1215,6 +1253,57 @@ static void disp_get_str(IDispatch *d, const wchar_t *name, char *out, int outsz
     if (!out[0]) snprintf(out, outsz, "%s", "N/A");
 }
 
+/* ------------------------------------------------------------------ *
+ *  what a Windows Update failure code actually means
+ *
+ *  Windows hands back a numeric code and shows "something went wrong" in
+ *  Settings.  The codes below are the ones that actually show up on the
+ *  laptops this tool is built for, with the fix that goes with each.  The
+ *  text is written to the log right beside the code, and the first one to
+ *  match becomes the verdict's next action.
+ * ------------------------------------------------------------------ */
+static const char *wu_failure_advice(unsigned long code)
+{
+    switch (code) {
+        case 0x80070070: case 0x80070008: case 0x800705AF:
+            return "the disk ran out of space - free space on C: (Windows needs "
+                   "room to unpack each update before it installs) and run again";
+        case 0x80070005:
+            return "Windows refused the work because the tool is not elevated - "
+                   "close LaptopPrep and start it as administrator";
+        case 0x800f0922:
+            return "the update could not be written to the system partition - "
+                   "usually the small recovery/system reserved partition is full; "
+                   "it also happens behind a proxy or VPN";
+        case 0x80073712: case 0x80070241: case 0x80070570: case 0x800f081f:
+            return "the component store is damaged - run the repair in the app "
+                   "('Fix update engine') or: DISM /Online /Cleanup-Image "
+                   "/RestoreHealth, then sfc /scannow, then restart";
+        case 0x80240017:
+            return "Windows says this update does not apply to this machine or its "
+                   "licence was refused - check the update's prerequisites";
+        case 0x8024402C: case 0x8024001E: case 0x80248007: case 0x80244022:
+            return "the update service could not be reached - a proxy, a VPN, a "
+                   "metered connection or the update server is in the way";
+        case 0x80070643: case 0x800706BE: case 0x800706BA:
+            return "the installer itself failed (this is the classic .NET / MSI "
+                   "failure, and on Windows 10 it is often the WinRE partition "
+                   "being too small) - the update needs to be installed by hand "
+                   "from the Microsoft Update Catalog";
+        case 0x8024200B: case 0x80246007:
+            return "the downloaded payload was rejected - the download cache is "
+                   "suspect, let 'Fix update engine' clear it and try again";
+        case 0xC1900208L: case 0xC1900101L:
+            return "a feature update was rolled back - usually a driver or an "
+                   "antivirus; remove or update the driver and try again";
+        case 0x8000FFFFL:
+            return "Windows reported an unspecified failure - in practice a "
+                   "restart plus 'Fix update engine' clears most of these";
+        default:
+            return NULL;
+    }
+}
+
 static const char *wua_code_str(long code)
 {
     switch (code) {
@@ -1941,12 +2030,20 @@ static void wu_do_install(WuJob *job, IDispatch *coll, long count)
                (unsigned long)hr,
                job->restart_required ? "   [restart required from here on]" : "");
         if ((unsigned long)hr == 0x80070005UL) job->access_denied = 1;
-        if ((unsigned long)rc == 0x80240017UL)
-            wu_log("     0x80240017: Windows refused the install - the update is "
-                   "not applicable to this machine or its licence was refused");
+        {
+            const char *adv = wu_failure_advice((unsigned long)hr);
+            if (!adv && rc == 4) adv = wu_failure_advice((unsigned long)hr);
+            if (adv && (rc == 4 || rc == 5 || (unsigned long)hr != 0)) {
+                wu_log("     what this means: %s", adv);
+                if (!g_wu.install_hresult)
+                    g_wu.install_hresult = (long)(unsigned long)hr;
+            }
+        }
         if (rc == 2 || rc == 3) {
             job->installed_any = 1;
             wu_log("     installed");
+        } else if (rc == 4 || rc == 5) {
+            g_wu.install_failed = 1;
         }
         res->lpVtbl->Release(res);
         if (single) single->lpVtbl->Release(single);
@@ -2168,6 +2265,111 @@ static void wu_components_health(void)
 }
 
 /* ==================================================================
+ *  a small worker pool
+ *
+ *  The parts of a run that do not depend on each other - the six hardware
+ *  and battery modules, and the questions the update stage asks about the
+ *  machine before it touches anything - used to run one after the other on
+ *  the engine thread.  The next thing could not start until the last one
+ *  had finished, so those phases cost the *sum* of their slowest members:
+ *  the WMI queries and a powercfg battery report back to back, a WinHTTP
+ *  reachability probe in front of every other check.
+ *
+ *  This pool runs up to PREP_POOL_MAX of them at once.  What it does not
+ *  do is pretend that Windows Update itself can be parallelised: the eight
+ *  update *steps* still run strictly in order, because Windows will not
+ *  install two updates at the same time no matter how many threads ask.
+ *  Only the questions run in parallel.
+ *
+ *  LP_NO_POOL=1 runs everything on one thread again (for bisecting).
+ * ================================================================== */
+#define PREP_POOL_MAX 6
+
+typedef void (*PrepTaskFn)(void *ctx);
+
+typedef struct {
+    PrepTaskFn fn;
+    void      *ctx;
+} PrepTask;
+
+typedef struct {
+    PrepTask *tasks;
+    int       n, next;
+    HANDLE    mx;
+} PoolState;
+
+static int pool_disabled(void)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("LP_NO_POOL");
+        off = (e && e[0] == '1') ? 1 : 0;
+    }
+    return off;
+}
+
+static int pool_width(void)
+{
+    const char *e = getenv("LP_POOL_THREADS");
+    int n = e && e[0] ? atoi(e) : PREP_POOL_MAX;
+    if (n < 1) n = 1;
+    if (n > PREP_POOL_MAX) n = PREP_POOL_MAX;
+    return n;
+}
+
+static DWORD WINAPI pool_worker(LPVOID p)
+{
+    PoolState *ps = (PoolState*)p;
+    for (;;) {
+        int i;
+        WaitForSingleObject(ps->mx, INFINITE);
+        i = (ps->next < ps->n) ? ps->next++ : -1;
+        ReleaseMutex(ps->mx);
+        if (i < 0) break;
+        ps->tasks[i].fn(ps->tasks[i].ctx);
+    }
+    return 0;
+}
+
+/* Runs every task on up to `want` threads (this thread is one of them) and
+ * returns when they are all done.  If the threads cannot be created the
+ * tasks still run, on this thread, one after the other. */
+static void prep_pool_run(PrepTask *tasks, int n, int want)
+{
+    HANDLE th[PREP_POOL_MAX];
+    PoolState ps;
+    int i, made = 0;
+
+    if (n <= 0) return;
+    if (pool_disabled()) want = 1;
+    if (want > PREP_POOL_MAX) want = PREP_POOL_MAX;
+    if (want > n) want = n;
+    if (want < 2) {
+        for (i = 0; i < n; i++) tasks[i].fn(tasks[i].ctx);
+        return;
+    }
+    ps.tasks = tasks; ps.n = n; ps.next = 0;
+    ps.mx = CreateMutexA(NULL, FALSE, NULL);
+    if (!ps.mx) {
+        for (i = 0; i < n; i++) tasks[i].fn(tasks[i].ctx);
+        return;
+    }
+    for (i = 0; i < want - 1 && made < PREP_POOL_MAX; i++) {
+        th[made] = CreateThread(NULL, 0, pool_worker, &ps, 0, NULL);
+        if (th[made]) made++;
+    }
+    if (made == 0) {
+        CloseHandle(ps.mx);
+        for (i = 0; i < n; i++) tasks[i].fn(tasks[i].ctx);
+        return;
+    }
+    pool_worker(&ps);                                  /* this thread helps */
+    WaitForMultipleObjects((DWORD)made, th, TRUE, INFINITE);
+    for (i = 0; i < made; i++) CloseHandle(th[i]);
+    CloseHandle(ps.mx);
+}
+
+/* ==================================================================
  *  the update orchestrator (usoclient)
  *
  *  usoclient drives the same engine Settings > Windows Update uses.  Its
@@ -2176,12 +2378,54 @@ static void wu_components_health(void)
  *  never freeze the run - we only watch the reboot flags and the download
  *  folder for evidence that the machine is doing something.
  * ================================================================== */
+/* usoclient, run out of System32.  LP_ORCH_FAKE=1 treats every verb as
+ * accepted without running it - the only way to exercise the two watch
+ * loops on a machine (or under Wine) that has no orchestrator at all. */
+static int uso_cmd(const char *verb, char *line, size_t n, int timeoutMs, DWORD *rc)
+{
+    static int fake = -1;
+    if (fake < 0) {
+        const char *e = getenv("LP_ORCH_FAKE");
+        fake = (e && e[0] == '1') ? 1 : 0;
+    }
+    sys32_cmd("usoclient.exe", verb, line, n);
+    if (fake) {
+        wu_log("test hook (LP_ORCH_FAKE=1): %s treated as accepted without "
+               "running usoclient", verb);
+        *rc = 0;
+        return 1;
+    }
+    return run_process_logged(line, timeoutMs, rc);
+}
+
+/* The idle budgets can be shortened for testing; unset, the compiled-in
+ * values apply (PREP_WU_ORCH_IDLE_MS / PREP_WU_DL_IDLE_MS). */
+static ULONGLONG ms_override(const char *name, ULONGLONG def)
+{
+    const char *e = getenv(name);
+    if (e && e[0]) {
+        long v = atol(e);
+        if (v > 0) return (ULONGLONG)v;
+    }
+    return def;
+}
+
+/* "2 min" / "45 s".  The idle budgets can be overridden down to seconds
+ * for testing, and a log line that says "0 min" helps nobody. */
+static void fmt_wait(char *out, size_t n, ULONGLONG ms)
+{
+    if (ms >= 60000ULL) snprintf(out, n, "%llu min", (unsigned long long)(ms / 60000ULL));
+    else                snprintf(out, n, "%llu s",   (unsigned long long)(ms / 1000ULL));
+}
+
 static int wu_orchestrator(void)
 {
     DWORD rc = 0;
     unsigned long long before;
     ULONGLONG t0, lastBeat = 0;
     ULONGLONG budget;
+    ULONGLONG idle = 0, bytes_at_start = 0;
+    int saw_work = 0;
     char line[MAX_PATH + 128];
 
     if (!g_wu.uso_present) {
@@ -2196,12 +2440,10 @@ static int wu_orchestrator(void)
     wu_scan_download();
     before = g_wuBytes;
 
-    sys32_cmd("usoclient.exe", "RefreshSettings", line, sizeof(line));
-    if (run_process_logged(line, 30000, &rc))
+    if (!uso_cmd("RefreshSettings", line, sizeof(line), 30000, &rc))
         wu_log("usoclient RefreshSettings -> exit %lu", (unsigned long)rc);
 
-    sys32_cmd("usoclient.exe", "StartScan", line, sizeof(line));
-    if (!run_process_logged(line, 60000, &rc)) {
+    if (!uso_cmd("StartScan", line, sizeof(line), 60000, &rc)) {
         if (rc == 5 || rc == ERROR_ACCESS_DENIED) {
             g_wu.access_denied = 1;
             wu_log("The orchestrator refused the scan: access denied. Windows "
@@ -2214,8 +2456,15 @@ static int wu_orchestrator(void)
     g_wu.uso_scan_ok = 1;
     wu_log("usoclient StartScan -> exit %lu", (unsigned long)rc);
 
+    /* The full budget is the outer limit; the idle budget is what actually
+     * runs when the machine is doing nothing, which is the normal answer on
+     * a laptop that already has its updates.  Ten minutes of that was ten
+     * minutes of nothing - a technician can see the machine is idle much
+     * sooner than that. */
     budget = PREP_WU_USO_SCAN_WAIT_MS;
+    idle   = ms_override("LP_ORCH_IDLE_MS", (ULONGLONG)PREP_WU_ORCH_IDLE_MS);
     t0 = GetTickCount64();
+    lastBeat = 0;
     for (;;) {
         ULONGLONG el = GetTickCount64() - t0;
         if (restart_flag_set()) {
@@ -2229,8 +2478,21 @@ static int wu_orchestrator(void)
         wu_scan_download();
         if (g_wuBytes > before || g_wuMsuN || g_wuCabN) {
             g_wu.uso_progress = 1;
+            saw_work = 1;
             wu_log("The update agent is working: %.1f MB of update payload on the "
                    "disk now", (double)g_wuBytes / (1024.0 * 1024.0));
+            break;
+        }
+        if (el > idle) {
+            char w1[32], w2[32], w3[32];
+            fmt_wait(w1, sizeof(w1), idle);
+            fmt_wait(w2, sizeof(w2), budget);
+            fmt_wait(w3, sizeof(w3), (ULONGLONG)PREP_WU_DL_IDLE_MS);
+            wu_log("The orchestrator has shown no sign of work in the first %s - "
+                   "no payload on the disk and no restart requirement. Sitting "
+                   "out the rest of the %s scan watch would be waiting for "
+                   "nothing, so the download/install ask goes out now and gets a "
+                   "short %s watch unless the agent starts working", w1, w2, w3);
             break;
         }
         if (el > budget) {
@@ -2254,21 +2516,36 @@ static int wu_orchestrator(void)
     }
 
     wu_log("Asking the orchestrator to download and install");
-    sys32_cmd("usoclient.exe", "StartDownload", line, sizeof(line));
-    if (!run_process_logged(line, 60000, &rc))
+    if (!uso_cmd("StartDownload", line, sizeof(line), 60000, &rc))
         wu_log("usoclient StartDownload -> exit %lu", (unsigned long)rc);
     else
         g_wu.uso_download_ok = 1;
     Sleep(3000);
-    sys32_cmd("usoclient.exe", "StartInstall", line, sizeof(line));
-    if (!run_process_logged(line, 60000, &rc))
+    if (!uso_cmd("StartInstall", line, sizeof(line), 60000, &rc))
         wu_log("usoclient StartInstall -> exit %lu", (unsigned long)rc);
     else
         g_wu.uso_install_ok = 1;
 
-    budget = PREP_WU_USO_INSTALL_WAIT_MS;
+    /* 25 minutes is the right budget for a real install - for an install
+     * that exists.  When the scan above found nothing queued, this watch
+     * starts on the short idle budget and is extended to the full one the
+     * moment the agent shows a single sign of life (payload moving on the
+     * disk, or a restart requirement). */
+    budget = saw_work ? (ULONGLONG)PREP_WU_USO_INSTALL_WAIT_MS
+                      : ms_override("LP_ORCH_DL_MS", (ULONGLONG)PREP_WU_DL_IDLE_MS);
+    if (!saw_work) {
+        char w1[32], w2[32];
+        fmt_wait(w1, sizeof(w1), budget);
+        fmt_wait(w2, sizeof(w2), (ULONGLONG)PREP_WU_USO_INSTALL_WAIT_MS);
+        wu_log("The scan had found nothing queued, so this watch starts on a %s "
+               "idle budget instead of %s; it is extended the moment the update "
+               "agent shows work", w1, w2);
+    }
+
     t0 = GetTickCount64();
     lastBeat = 0;
+    wu_scan_download();
+    bytes_at_start = (ULONGLONG)g_wuBytes;
     for (;;) {
         ULONGLONG el = GetTickCount64() - t0;
         if (restart_flag_set()) {
@@ -2278,9 +2555,29 @@ static int wu_orchestrator(void)
                    "restart");
             return 1;
         }
+        wu_scan_download();
+        if (budget != (ULONGLONG)PREP_WU_USO_INSTALL_WAIT_MS &&
+            (ULONGLONG)g_wuBytes != bytes_at_start) {
+            budget = (ULONGLONG)PREP_WU_USO_INSTALL_WAIT_MS;
+            bytes_at_start = (ULONGLONG)g_wuBytes;
+            {
+                char w1[32];
+                fmt_wait(w1, sizeof(w1), budget);
+                wu_log("The update agent is working - the install watch is "
+                       "extended to the full %s", w1);
+            }
+        }
         if (el > budget) {
-            wu_log("The orchestrator install watch timed out after %llu minutes "
-                   "without a restart requirement", (unsigned long long)(el / 60000));
+            char w1[32], w2[32];
+            fmt_wait(w1, sizeof(w1), el);
+            fmt_wait(w2, sizeof(w2), (ULONGLONG)PREP_WU_USO_INSTALL_WAIT_MS);
+            if (budget == (ULONGLONG)PREP_WU_USO_INSTALL_WAIT_MS)
+                wu_log("The orchestrator install watch timed out after %s without "
+                       "a restart requirement", w1);
+            else
+                wu_log("Nothing came back from the orchestrator in %s and the scan "
+                       "had found nothing queued either, so the watch stops here "
+                       "instead of running to %s", w1, w2);
             return 0;
         }
         Sleep(2000);
@@ -2299,6 +2596,25 @@ static int wu_orchestrator(void)
 /* ==================================================================
  *  the stage itself
  * ================================================================== */
+/* Free space on the system drive.  Downloads fail with 0x80070070 when the
+ * disk is nearly full, and on a refurbished laptop with a small SSD that is
+ * the first thing worth knowing - better to say so before waiting half an
+ * hour for an install that cannot succeed. */
+static int system_drive_free_pct(void)
+{
+    ULARGE_INTEGER freeBytes, total;
+    if (!GetDiskFreeSpaceExA("C:\\", &freeBytes, &total, NULL)) return -1;
+    if (total.QuadPart == 0) return -1;
+    return (int)((freeBytes.QuadPart * 100ull) / total.QuadPart);
+}
+
+static unsigned long long system_drive_free_mb(void)
+{
+    ULARGE_INTEGER freeBytes, total;
+    if (!GetDiskFreeSpaceExA("C:\\", &freeBytes, &total, NULL)) return 0;
+    return (unsigned long long)(freeBytes.QuadPart / (1024ull * 1024ull));
+}
+
 /* after an install attempt, is anything still on the to-do list? */
 static int pending_left_unknown(WuState *s)
 {
@@ -2324,6 +2640,64 @@ static void wu_service_probe(void)
         wu_log("  %-8s : %s", svc[i], ok ? "running" : svc_state_text(svc[i]));
         if (ok) g_wu.services_started++;
     }
+}
+
+/* ---------- the update stage's opening survey, in parallel ----------
+ * Five independent questions, four of them with a network or registry
+ * round trip in them.  Each task writes exactly one field of the struct,
+ * so nothing here needs a lock. */
+typedef struct {
+    unsigned long long freeMB;
+    int  freePct;
+    int  reboot_before;
+    int  internet;
+    int  session;
+    int  uso_present;
+    char who[128];
+} SurveyOut;
+
+static void survey_disk(void *c)
+{
+    SurveyOut *s = (SurveyOut*)c;
+    s->freeMB = system_drive_free_mb();
+    s->freePct = system_drive_free_pct();
+}
+
+static void survey_reboot(void *c)
+{
+    SurveyOut *s = (SurveyOut*)c;
+    s->reboot_before = restart_flag_set() || wua_reboot_pending();
+}
+
+static void survey_net(void *c)
+{
+    SurveyOut *s = (SurveyOut*)c;
+    s->internet = probe_network();
+}
+
+static void survey_session(void *c)
+{
+    SurveyOut *s = (SurveyOut*)c;
+    s->who[0] = 0;
+    s->session = active_user_session(s->who, sizeof(s->who));
+}
+
+static void survey_orchestrator(void *c)
+{
+    SurveyOut *s = (SurveyOut*)c;
+    s->uso_present = sys32_tool("usoclient.exe");
+}
+
+static void run_survey_parallel(SurveyOut *s)
+{
+    PrepTask t[5];
+    memset(s, 0, sizeof(*s));
+    t[0].fn = survey_disk;         t[0].ctx = s;
+    t[1].fn = survey_reboot;       t[1].ctx = s;
+    t[2].fn = survey_net;          t[2].ctx = s;
+    t[3].fn = survey_session;      t[3].ctx = s;
+    t[4].fn = survey_orchestrator; t[4].ctx = s;
+    prep_pool_run(t, 5, pool_width());
 }
 
 static int do_windows_update(void)
@@ -2361,19 +2735,31 @@ static int do_windows_update(void)
     }
     wu_log("Windows build: %d", g_wu.win_build);
 
-    wu_log("Reading the state this machine is in before touching anything:");
-    wu_log("  restart flags in the registry and the component store...");
-    g_wu.reboot_before = restart_flag_set() || wua_reboot_pending();
-    g_wu.reboot_after = g_wu.reboot_before;
+    wu_log("Reading the state this machine is in before touching anything "
+           "(disk, restart flags, network, session and the orchestrator are "
+           "asked at the same time - %d threads):", pool_width());
+    {
+        SurveyOut s;
+        run_survey_parallel(&s);
+        if (s.freeMB > 0) {
+            wu_log("  free space on C: %llu MB (%d%% of the drive)", s.freeMB, s.freePct);
+            if (s.freeMB < 8000ull)
+                wu_log("  the system drive is tight: Windows needs several "
+                       "gigabytes of headroom to unpack updates, and a full disk "
+                       "is the most common reason a download or install fails "
+                       "(0x80070070). Free space before the next run if you can.");
+        }
+        g_wu.reboot_before = s.reboot_before;
+        g_wu.reboot_after = g_wu.reboot_before;
+        g_wu.internet_likely = s.internet;
+        g_wu.user_session = s.session;
+        g_wu.uso_present = s.uso_present;
+        if (s.session) snprintf(who, sizeof(who), "%s", s.who);
+    }
     wu_log("  a restart was %s pending before this run",
            g_wu.reboot_before ? "already" : "not");
-    wu_log("  reaching the Microsoft update endpoints...");
-    g_wu.internet_likely = probe_network();
     wu_log("  network probe: %s", g_wu.internet_likely ? "answered" : "no answer");
-    wu_log("  which session this tool is running in...");
-    g_wu.user_session = active_user_session(who, sizeof(who));
     wu_log("  session check done");
-    g_wu.uso_present = sys32_tool("usoclient.exe");
     wu_log("  usoclient.exe: %s", g_wu.uso_present ? "present" : "not on this build");
 
     wu_log("Internet reachability probe: %s", g_wu.internet_likely
@@ -2801,15 +3187,128 @@ void probe_environment(void)
  * as dead code - which is exactly what happened in the first build of this
  * app. */
 static volatile char g_logUrl[512];
+static char g_urlSource[64] = "built in";
+
+static int url_ok(const char *s)
+{
+    return s && (strncmp(s, "http://", 7) == 0 || strncmp(s, "https://", 8) == 0);
+}
+
+/* LaptopPrep.cfg next to the exe, one "url=..." line.  This is the way a
+ * shop points every laptop at its own server: copy the folder, edit one
+ * text file. */
+static int url_from_cfg(char *out, size_t n)
+{
+    char exe[MAX_PATH], cfg[MAX_PATH];
+    char line[600];
+    FILE *f;
+    char *slash;
+    if (!GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe))) return 0;
+    slash = strrchr(exe, '\\');
+    if (!slash) return 0;
+    *(slash + 1) = 0;
+    snprintf(cfg, sizeof(cfg), "%sLaptopPrep.cfg", exe);
+    f = fopen(cfg, "rb");
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line, *e;
+        while (*p == ' ' || *p == '\t') p++;
+        if (_strnicmp(p, "url", 3) != 0) continue;
+        p += 3;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != '=') continue;
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        e = p + strlen(p);
+        while (e > p && (e[-1] == '\r' || e[-1] == '\n' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+        if (url_ok(p)) {
+            snprintf(out, n, "%s", p);
+            fclose(f);
+            return 1;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+static int url_from_registry(char *out, size_t n)
+{
+    HKEY k;
+    DWORD sz = (DWORD)n, type = 0;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Esprit ICT\\LaptopPrep", 0,
+                      KEY_READ, &k) != ERROR_SUCCESS) return 0;
+    if (RegQueryValueExA(k, "LogUrl", NULL, &type, (LPBYTE)out, &sz) == ERROR_SUCCESS &&
+        type == REG_SZ && url_ok(out)) {
+        RegCloseKey(k);
+        return 1;
+    }
+    RegCloseKey(k);
+    return 0;
+}
+
+static void prep_url_load(void);
+
+const char *prep_log_url(void)
+{
+    prep_url_load();
+    return (const char*)g_logUrl;
+}
+
+const char *prep_log_url_source(void) { return g_urlSource; }
+
+int prep_log_url_set(const char *url)
+{
+    char exe[MAX_PATH], cfg[MAX_PATH];
+    char *slash;
+    FILE *f;
+    HKEY k;
+    DWORD disp;
+    if (!url_ok(url) || strlen(url) > 450) return 0;
+    if (strchr(url, ' ') || strchr(url, '\n') || strchr(url, '\r') || strchr(url, '\t'))
+        return 0;
+    if (!GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe))) return 0;
+    slash = strrchr(exe, '\\');
+    if (!slash) return 0;
+    *(slash + 1) = 0;
+    snprintf(cfg, sizeof(cfg), "%sLaptopPrep.cfg", exe);
+    f = fopen(cfg, "wb");
+    if (f) {
+        fprintf(f, "# LaptopPrep - where the finished log is posted.\r\n"
+                   "# Change it here or in the Settings view of the console.\r\n"
+                   "url=%s\r\n", url);
+        fclose(f);
+    }
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\Esprit ICT\\LaptopPrep", 0, NULL, 0,
+                        KEY_WRITE, NULL, &k, &disp) == ERROR_SUCCESS) {
+        RegSetValueExA(k, "LogUrl", 0, REG_SZ, (const BYTE*)url,
+                       (DWORD)strlen(url) + 1);
+        RegCloseKey(k);
+    }
+    prep_url_load();
+    return 1;
+}
 
 static void prep_url_load(void)
 {
-    /* LP_LOG_URL is a test hook: it lets the upload be pointed at a local
-     * server (or a port that refuses connections) without a rebuild, which
-     * is how the "upload failed" wording in the restart offer is checked.
-     * Unset, the compiled-in endpoint is used. */
+    /* LP_LOG_URL is a test hook and the first choice: it lets the upload be
+     * pointed at a local server (or a port that refuses connections)
+     * without a rebuild, which is how the "upload failed" wording in the
+     * restart offer is checked.  Then the config file next to the exe, then
+     * HKCU, then the compiled-in endpoint. */
+    char buf[512];
     const char *env = getenv("LP_LOG_URL");
-    const char *src = (env && env[0]) ? env : PREP_LOG_URL;
+    const char *src = PREP_LOG_URL;
+    snprintf(g_urlSource, sizeof(g_urlSource), "built in");
+    if (env && env[0]) {
+        src = env;
+        snprintf(g_urlSource, sizeof(g_urlSource), "LP_LOG_URL");
+    } else if (url_from_cfg(buf, sizeof(buf))) {
+        src = buf;
+        snprintf(g_urlSource, sizeof(g_urlSource), "LaptopPrep.cfg");
+    } else if (url_from_registry(buf, sizeof(buf))) {
+        src = buf;
+        snprintf(g_urlSource, sizeof(g_urlSource), "HKCU\\Software\\Esprit ICT\\LaptopPrep");
+    }
     volatile char *dst = g_logUrl;
     size_t i = 0;
     for (;;) {
@@ -2881,10 +3380,21 @@ static int parse_url(const char *url, char *host, int hostsz,
  * whether the run record is safe on the server before it offers a restart:
  *  0 = never attempted, 1 = uploaded, -1 = failed. */
 static volatile LONG g_lastUploadOk = 0;
+static volatile LONG g_lastUploadHttp = 0;
 
 int prep_last_upload_result(void)
 {
     return (int)g_lastUploadOk;
+}
+
+int prep_last_upload_http(void)
+{
+    return (int)InterlockedCompareExchange(&g_lastUploadHttp, 0, 0);
+}
+
+static void upload_http_note(LONG code)
+{
+    InterlockedExchange(&g_lastUploadHttp, code);
 }
 
 static int log_upload_sync(const char *filepath)
@@ -2900,15 +3410,18 @@ static int log_upload_sync(const char *filepath)
     char line[1024];
 
     prep_url_load();
+    upload_http_note(0);
     if (prep_url_is_placeholder()) {
         snprintf(line, sizeof(line), "Log server not configured (%s), upload skipped",
                  PREP_LOG_URL);
         write_log(line);
+        upload_http_note(-2);
         return 0;
     }
     if (!parse_url((const char*)g_logUrl, host, sizeof(host), path, sizeof(path),
                    &secure, &port)) {
         write_log("Invalid server URL format");
+        upload_http_note(-2);
         return 0;
     }
     f = fopen(filepath, "rb");
@@ -2957,13 +3470,12 @@ static int log_upload_sync(const char *filepath)
         return 0;
     }
 
-    /* identifying headers make the server side log usable when a shop has
-     * fifty laptops in the same rack */
-    MultiByteToWideChar(CP_UTF8, 0, g_computer, -1, whost, 256);
-    snprintf(line, sizeof(line),
-             "Content-Type: text/plain; charset=utf-8\r\nX-LaptopPrep: "
-             PREP_VERSION_STR "\r\nX-LaptopPrep-Computer: %s", g_computer);
-    MultiByteToWideChar(CP_UTF8, 0, line, -1, wheader, 512);
+    /* Exactly what the esprit-ict tool sends to this endpoint: one header,
+     * Content-Type: text/plain, and the log text as the whole body.  Extra
+     * invented headers are how an upload gets turned away by a server that
+     * only expects this, and the computer name and version are already the
+     * first lines of the log itself. */
+    MultiByteToWideChar(CP_UTF8, 0, "Content-Type: text/plain", -1, wheader, 512);
 
     if (!WinHttpSendRequest(hreq, wheader, (DWORD)-1L,
             fbuf, (DWORD)fsize, (DWORD)fsize, 0)) {
@@ -2976,6 +3488,7 @@ static int log_upload_sync(const char *filepath)
             snprintf(line, sizeof(line), "Server upload status %lu",
                      (unsigned long)status);
             write_log(line);
+            upload_http_note((LONG)status);
             if (status >= 200 && status < 300) ok = 1;
             /* say what a refusal actually means, so nobody has to guess */
             else if (status == 404)
@@ -2995,9 +3508,11 @@ static int log_upload_sync(const char *filepath)
                           "check the service behind the domain");
         }
     } else {
-        snprintf(line, sizeof(line), "WinHttpReceiveResponse failed %lu",
+        snprintf(line, sizeof(line), "WinHttpReceiveResponse failed %lu - no "
+                 "answer from the server at all (DNS, TLS or the network)",
                  (unsigned long)GetLastError());
         write_log(line);
+        upload_http_note(-1);
     }
     WinHttpCloseHandle(hreq);
     WinHttpCloseHandle(hconn);
@@ -3080,18 +3595,83 @@ int log_upload(const char *filepath)
 /* ==================================================================
  *  the run itself
  * ================================================================== */
+/* ==================================================================
+ *  the six read-only modules, each on its own thread
+ *
+ *  Every WMI module opens its own connection: two threads sharing one
+ *  IWbemServices proxy is exactly the kind of thing that works on a
+ *  developer machine and fails in a shop.  The battery module is a
+ *  powercfg child process and needs neither.
+ * ================================================================== */
+typedef enum { MOD_SPECS, MOD_DEV_ID, MOD_BOARD, MOD_EXTRA, MOD_TPM, MOD_BATTERY } ModKind;
+
+typedef struct {
+    unsigned   bit;
+    ModKind    which;
+    volatile LONG ok;
+} ModTask;
+
+static const char *mod_skip_name(ModKind k)
+{
+    switch (k) {
+        case MOD_SPECS:   return "SPECS";
+        case MOD_DEV_ID:  return "DEVICE ID";
+        case MOD_BOARD:   return "MOTHERBOARD";
+        case MOD_EXTRA:   return "EXTRA";
+        case MOD_TPM:     return "TPM";
+        default:          return "MODULE";
+    }
+}
+
+static void module_task(void *c)
+{
+    ModTask *t = (ModTask*)c;
+    IWbemServices *svc = NULL;
+    IWbemLocator *loc = NULL;
+
+    if (t->which == MOD_BATTERY) {          /* powercfg child process */
+        run_battery_report();
+        InterlockedExchange(&t->ok, 1);
+        return;
+    }
+    if (!wmi_init(&svc, &loc)) {            /* also initialises COM here */
+        char b[96];
+        snprintf(b, sizeof(b), "%s skipped (no WMI)", mod_skip_name(t->which));
+        write_log(b);
+        return;
+    }
+    switch (t->which) {
+        case MOD_SPECS:  collect_specs(svc);     break;
+        case MOD_DEV_ID: collect_device_id(svc); break;
+        case MOD_BOARD:  collect_motherboard(svc); break;
+        case MOD_EXTRA:  collect_extra(svc);     break;
+        case MOD_TPM:    collect_tpm(loc);       break;
+        default:                                 break;
+    }
+    InterlockedExchange(&t->ok, 1);
+    wmi_uninit(svc, loc);
+    CoUninitialize();                       /* matches wmi_init's init */
+}
+
 int prep_run_all(unsigned flags)
 {
     /* the upload result belongs to one run only: a stale "uploaded" from an
      * earlier run must never be shown next to a fresh log */
     InterlockedExchange(&g_lastUploadOk, 0);
-    IWbemServices *svc = NULL;
-    IWbemLocator *loc = NULL;
     char line[1024];
     int needWmi = (flags & (PREP_M_SPECS | PREP_M_DEVICE_ID | PREP_M_BOARD |
                             PREP_M_EXTRA | PREP_M_TPM)) ? 1 : 0;
-    unsigned firstAnnounced = 0;
+    int engineCom = 0;
     int wuOk = 1;
+
+    /* The engine thread keeps its own COM apartment: the update stage
+     * makes Windows Update Agent calls on this thread, and each module
+     * thread above opens its own connection. */
+    {
+        HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        engineCom = SUCCEEDED(hr) ? 1 : 0;
+    }
+    (void)needWmi;
 
     if (g_logNotice[0]) write_log(g_logNotice);
     write_log("===== LaptopPrep run =====");
@@ -3110,60 +3690,51 @@ int prep_run_all(unsigned flags)
     snprintf(line, sizeof(line), "Selected modules: 0x%04X", flags);
     write_log(line);
 
-    if (needWmi) {
-        /* tell the UI what is happening before the (occasionally slow) WMI
-         * handshake, otherwise the window just sits there looking dead */
-        unsigned wmiOrder[5];
-        int k, n = 0;
-        wmiOrder[n++] = PREP_M_SPECS;
-        wmiOrder[n++] = PREP_M_DEVICE_ID;
-        wmiOrder[n++] = PREP_M_BOARD;
-        wmiOrder[n++] = PREP_M_EXTRA;
-        wmiOrder[n++] = PREP_M_TPM;
-        for (k = 0; k < n; k++) {
-            if (prep_select(flags, wmiOrder[k])) {
-                firstAnnounced = wmiOrder[k];
-                gui_on_module_begin(wmiOrder[k]);
-                break;
-            }
-        }
-        write_log("Connecting to WMI...");
-        if (!wmi_init(&svc, &loc)) {
-            write_log("WMI init failed, the hardware modules will be skipped");
-            svc = NULL;
-            loc = NULL;
-        }
-    }
+    /* ------------------------------------------------------------------
+     *  The six modules that only *read* the machine - five WMI queries and
+     *  the powercfg battery report - run at the same time, each on its own
+     *  thread with its own WMI connection.  They touch nothing that another
+     *  one touches: separate connections, separate files, and the log has a
+     *  mutex.  The update stage below is deliberately NOT in this group -
+     *  Windows installs one update at a time, and pretending otherwise is
+     *  how a tool corrupts a component store.
+     * ---------------------------------------------------------------- */
+    {
+        ModTask mt[6];
+        PrepTask pt[6];
+        int n = 0, k, i;
 
-    if (prep_select(flags, PREP_M_SPECS)) {
-        if (!(needWmi && firstAnnounced == PREP_M_SPECS)) gui_on_module_begin(PREP_M_SPECS);
-        if (svc) collect_specs(svc); else write_log("SPECS skipped (no WMI)");
-        gui_on_module_result(PREP_M_SPECS, svc != NULL);
-    }
-    if (prep_select(flags, PREP_M_DEVICE_ID)) {
-        if (!(needWmi && firstAnnounced == PREP_M_DEVICE_ID)) gui_on_module_begin(PREP_M_DEVICE_ID);
-        if (svc) collect_device_id(svc); else write_log("DEVICE ID skipped (no WMI)");
-        gui_on_module_result(PREP_M_DEVICE_ID, svc != NULL);
-    }
-    if (prep_select(flags, PREP_M_BOARD)) {
-        if (!(needWmi && firstAnnounced == PREP_M_BOARD)) gui_on_module_begin(PREP_M_BOARD);
-        if (svc) collect_motherboard(svc); else write_log("MOTHERBOARD skipped (no WMI)");
-        gui_on_module_result(PREP_M_BOARD, svc != NULL);
-    }
-    if (prep_select(flags, PREP_M_EXTRA)) {
-        if (!(needWmi && firstAnnounced == PREP_M_EXTRA)) gui_on_module_begin(PREP_M_EXTRA);
-        if (svc) collect_extra(svc); else write_log("EXTRA skipped (no WMI)");
-        gui_on_module_result(PREP_M_EXTRA, svc != NULL);
-    }
-    if (prep_select(flags, PREP_M_TPM)) {
-        if (!(needWmi && firstAnnounced == PREP_M_TPM)) gui_on_module_begin(PREP_M_TPM);
-        if (loc) collect_tpm(loc); else write_log("TPM skipped (no WMI)");
-        gui_on_module_result(PREP_M_TPM, loc != NULL);
-    }
-    if (prep_select(flags, PREP_M_BATTERY)) {
-        gui_on_module_begin(PREP_M_BATTERY);
-        run_battery_report();
-        gui_on_module_result(PREP_M_BATTERY, 1);
+        if (prep_select(flags, PREP_M_SPECS)) {
+            mt[n].bit = PREP_M_SPECS; mt[n].which = MOD_SPECS; mt[n].ok = 0; n++;
+        }
+        if (prep_select(flags, PREP_M_DEVICE_ID)) {
+            mt[n].bit = PREP_M_DEVICE_ID; mt[n].which = MOD_DEV_ID; mt[n].ok = 0; n++;
+        }
+        if (prep_select(flags, PREP_M_BOARD)) {
+            mt[n].bit = PREP_M_BOARD; mt[n].which = MOD_BOARD; mt[n].ok = 0; n++;
+        }
+        if (prep_select(flags, PREP_M_EXTRA)) {
+            mt[n].bit = PREP_M_EXTRA; mt[n].which = MOD_EXTRA; mt[n].ok = 0; n++;
+        }
+        if (prep_select(flags, PREP_M_TPM)) {
+            mt[n].bit = PREP_M_TPM; mt[n].which = MOD_TPM; mt[n].ok = 0; n++;
+        }
+        if (prep_select(flags, PREP_M_BATTERY)) {
+            mt[n].bit = PREP_M_BATTERY; mt[n].which = MOD_BATTERY; mt[n].ok = 0; n++;
+        }
+        if (n > 1) {
+            char b[128];
+            snprintf(b, sizeof(b), "Running %d modules at the same time on %d "
+                     "threads (they only read the machine)", n, pool_width());
+            write_log(b);
+        }
+        for (i = 0; i < n; i++) {
+            pt[i].fn = module_task; pt[i].ctx = &mt[i];
+            gui_on_module_begin(mt[i].bit);
+        }
+        prep_pool_run(pt, n, pool_width());
+        for (k = 0; k < n; k++)
+            gui_on_module_result(mt[k].bit, mt[k].ok);
     }
     if (prep_select(flags, PREP_M_UPDATES)) {
         gui_on_module_begin(PREP_M_UPDATES);
@@ -3208,7 +3779,6 @@ int prep_run_all(unsigned flags)
 
     write_log("===== LaptopPrep run finished =====");
 
-    if (svc || loc) CoUninitialize();
-    wmi_uninit(svc, loc);
+    if (engineCom) CoUninitialize();
     return 0;
 }

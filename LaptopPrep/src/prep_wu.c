@@ -27,7 +27,8 @@ static const char *const NOTE[WU_STEP_COUNT] = {
     "the local update store, downloaded packages and restart flags",
     "wusa / dism on the .msu and .cab files already on this disk",
     "DISM payload check - the repair only runs when it is needed",
-    "usoclient, per machine, and it cannot be waited on forever",
+    "usoclient asks, then watches while Windows installs - it stops early "
+    "when nothing is queued",
     "the per-user half of the update engine",
     "local cache first, then the online service",
     "one update at a time, every one named in the log",

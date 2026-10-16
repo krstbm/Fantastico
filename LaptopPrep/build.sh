@@ -39,6 +39,43 @@ LIBS="-lole32 -loleaut32 -lwbemuuid -lwinhttp -lws2_32 -liphlpapi \
 CFLAGS_COMMON="-std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter \
  -Wno-unknown-pragmas -D_WIN32_WINNT=0x0A00 -D_WIN32_IE=0x0A00 -I $SRC"
 
+# --- does this gcc know -municode? -----------------------------------
+#  The GUI uses the Unicode entry point (wWinMain), which mingw-w64 turns
+#  on with -municode.  The old MinGW.org compiler and Cygwin's gcc reject
+#  that flag, so probe once and fall back to the WinMain entry point
+#  (-DLP_ANSI_ENTRY) when it is missing - same program either way.
+MUNICODE="-municode"
+ENTRYDEF=""
+if ! echo 'int main(void){return 0;}' > /tmp/lp_probe.c 2>/dev/null ||
+   ! "$GCC" -municode -c /tmp/lp_probe.c -o /tmp/lp_probe.o >/dev/null 2>&1; then
+    MUNICODE=""
+    ENTRYDEF="-DLP_ANSI_ENTRY"
+    echo "  note: this gcc has no -municode - using the WinMain entry point"
+fi
+rm -f /tmp/lp_probe.c /tmp/lp_probe.o
+
+# --- can this gcc build the project at all? --------------------------
+#  tools/build_probe.c includes every SDK header the project uses and
+#  takes one symbol from every library it links.  A compiler without the
+#  WMI / WinHTTP / GDI+ headers (MinGW.org, Cygwin) stops here with one
+#  clear message instead of dying halfway through $SRC/prep_core.c.
+if [ -f tools/build_probe.c ]; then
+    if ! $GCC tools/build_probe.c -o /tmp/lp_sdk_probe.exe $CFLAGS_COMMON $LIBS \
+         > /tmp/lp_sdk_probe.log 2>&1; then
+        echo
+        echo "  This gcc cannot build LaptopPrep:"
+        echo "    $($GCC -dumpmachine 2>/dev/null)"
+        sed 's/^/      /' /tmp/lp_sdk_probe.log | head -6
+        echo "  It needs the WMI, WinHTTP, GDI+ and psapi headers that ship"
+        echo "  with mingw-w64.  Use a MinGW-w64 toolchain, or run the built"
+        echo "  LaptopPrep.exe / LaptopPrep-console.exe that shipped with this"
+        echo "  folder - nothing has to be compiled to use those."
+        rm -f /tmp/lp_sdk_probe.log
+        exit 1
+    fi
+    rm -f /tmp/lp_sdk_probe.exe /tmp/lp_sdk_probe.log
+fi
+
 # prep_wu.c MUST be on both link lines: it holds the update decision layer
 CORE="$SRC/prep_core.c $SRC/prep_wu.c"
 
@@ -88,7 +125,7 @@ stage_assets() {
 build_gui() {
     msg "compiling $OUT_GUI (windowed, GDI+)"
     $GCC $CFLAGS_COMMON $CORE "$SRC/prep_gui.c" "$BUILD/prep.res" \
-         -o "$OUT_GUI" -municode -mwindows -Wl,--subsystem,windows -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,0 $LIBS \
+         $ENTRYDEF -o "$OUT_GUI" $MUNICODE -mwindows -Wl,--subsystem,windows -Wl,--major-subsystem-version,6 -Wl,--minor-subsystem-version,0 $LIBS \
         || fail "$OUT_GUI did not link"
     $STRIP "$OUT_GUI" 2>/dev/null
     msg "$OUT_GUI  ->  $(du -h "$OUT_GUI" | cut -f1)"
@@ -117,7 +154,7 @@ all)
     need_compiler; build_res; build_gui; stage_assets
     msg ""
     msg "done: ./$OUT_GUI"
-    msg "log goes to C:\\RefurbLogs\\LaptopPrep.log"
+    msg "log goes to C:\\RefurbLogs\\<COMPUTERNAME>_prep.log"
     ;;
 console)
     need_compiler; build_res; build_console
