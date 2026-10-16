@@ -1,0 +1,16 @@
+LaptopPrep - licence
+====================
+
+Copyright (c) 2026 Wintr & AGPCS. All rights reserved.
+
+LaptopPrep is made for, and licensed to, Wintr and AGPCS and their customers.
+Copying, redistributing, reselling or using this tool (in whole or in part,
+including its source code and its Windows Update stage) without the written
+permission of Wintr & AGPCS is not allowed.
+
+    Wintr  -  https://wintr.lol
+    AGPCS  -  https://agpcs.nl
+
+The licence is shown inside the program on the About page, in the version
+resource of LaptopPrep.exe (CompanyName / LegalCopyright), and in the header
+of every log file.
